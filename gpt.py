@@ -23,8 +23,12 @@ from apex.transformer.pipeline_parallel.utils import (
 from apex.contrib.optimizers.distributed_fused_adam import DistributedFusedAdam
 
 import torch._dynamo
+
 torch._dynamo.allow_in_graph(rearrange)
-torch._dynamo.allow_in_graph(tensor_parallel.layers.linear_with_grad_accumulation_and_async_allreduce)
+# torch._dynamo.allow_in_graph(
+#     tensor_parallel.layers.linear_with_grad_accumulation_and_async_allreduce
+# )
+
 
 class PipelineStage(nn.Module):
     input_tensors: Optional[List[torch.Tensor]] = None
@@ -104,7 +108,54 @@ def apply_rotary_emb(
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
-torch._dynamo.allow_in_graph(apply_rotary_emb)
+
+"rewrite above to not use complex numbers, using cmul instead"
+
+
+def precompute_freqs(dim: int, end: int, theta: float = 10000.0):
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device)  # type: ignore
+    freqs = torch.outer(t, freqs).float()  # type: ignore
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    return torch.view_as_real(freqs_cis)
+
+
+def reshape_for_broadcast(freqs, x):
+    ndim = x.ndim
+    assert 0 <= 1 < ndim
+    assert freqs.shape == (
+        x.shape[1],
+        x.shape[-2],
+        x.shape[-1],
+    ), f"{freqs.shape=} != {x.shape=}"
+    shape = [d if i == 1 or i >= ndim - 2 else 1 for i, d in enumerate(x.shape)]
+    return freqs.view(*shape)
+
+
+def cmul(x, y):
+    return torch.stack(
+        [
+            x[..., 0] * y[..., 0] - x[..., 1] * y[..., 1],
+            x[..., 0] * y[..., 1] + x[..., 1] * y[..., 0],
+        ],
+        dim=-1,
+    )
+
+
+def apply_rotary_emb(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    xq_ = xq.float().reshape(*xq.shape[:-1], -1, 2)
+    xk_ = xk.float().reshape(*xk.shape[:-1], -1, 2)
+    xq_out = cmul(xq_, freqs).flatten(3)
+    xk_out = cmul(xk_, freqs).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+# torch._dynamo.allow_in_graph(apply_rotary_emb)
+
 
 def add_bias(x: Tuple[torch.tensor, Optional[torch.Tensor]]):
     x, bias = x
@@ -127,7 +178,7 @@ class Attention(nn.Module):
             bias=False,
             gather_output=False,
             init_method=lambda x: x,
-            params_dtype=dtype
+            params_dtype=dtype,
         )
         self.wk = tensor_parallel.ColumnParallelLinear(
             args.dim,
@@ -135,7 +186,7 @@ class Attention(nn.Module):
             bias=False,
             gather_output=False,
             init_method=lambda x: x,
-            params_dtype=dtype
+            params_dtype=dtype,
         )
         self.wv = tensor_parallel.ColumnParallelLinear(
             args.dim,
@@ -143,7 +194,7 @@ class Attention(nn.Module):
             bias=False,
             gather_output=False,
             init_method=lambda x: x,
-            params_dtype=dtype
+            params_dtype=dtype,
         )
         self.wo = tensor_parallel.RowParallelLinear(
             args.n_heads * self.head_dim,
@@ -151,7 +202,7 @@ class Attention(nn.Module):
             bias=False,
             input_is_parallel=True,
             init_method=lambda x: x,
-            params_dtype=dtype
+            params_dtype=dtype,
         )
 
     def forward(
@@ -168,7 +219,7 @@ class Attention(nn.Module):
         xk = rearrange(xk, "s b (nh hd) -> b s nh hd", nh=self.n_local_heads)
         values = rearrange(xv, "s b (nh hd) -> b s nh hd", nh=self.n_local_heads)
 
-        xq, keys = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        xq, keys = apply_rotary_emb(xq, xk, freqs=freqs_cis)
 
         keys = rearrange(keys, "b s nh hd -> b nh s hd")
         values = rearrange(values, "b s nh hd -> b nh s hd")
@@ -212,13 +263,28 @@ class FeedForward(nn.Module):
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
         self.w1 = tensor_parallel.ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x, params_dtype=dtype
+            dim,
+            hidden_dim,
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x,
+            params_dtype=dtype,
         )
         self.w2 = tensor_parallel.RowParallelLinear(
-            hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x, params_dtype=dtype
+            hidden_dim,
+            dim,
+            bias=False,
+            input_is_parallel=True,
+            init_method=lambda x: x,
+            params_dtype=dtype,
         )
         self.w3 = tensor_parallel.ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x, params_dtype=dtype
+            dim,
+            hidden_dim,
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x,
+            params_dtype=dtype,
         )
 
     def forward(self, x):
@@ -233,7 +299,10 @@ class TransformerBlock(nn.Module):
         self.head_dim = args.dim // args.n_heads
         self.attention = Attention(args, dtype=dtype)
         self.feed_forward = FeedForward(
-            dim=args.dim, hidden_dim=4 * args.dim, multiple_of=args.multiple_of, dtype=dtype
+            dim=args.dim,
+            hidden_dim=4 * args.dim,
+            multiple_of=args.multiple_of,
+            dtype=dtype,
         )
         self.layer_id = layer_id
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps, dtype=dtype)
@@ -256,14 +325,29 @@ class SplitLlama(nn.Module):
         super().__init__()
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         pp_world = parallel_state.get_pipeline_model_parallel_world_size()
+        tp_world = parallel_state.get_tensor_model_parallel_world_size()
+
         curr_rank_layers = args.n_layers // pp_world
         start_layer = pp_rank * curr_rank_layers
 
         self.layers = nn.ModuleList(
-            [TransformerBlock(i + start_layer, args, dtype) for i in range(curr_rank_layers)]
+            [
+                torch.compile(TransformerBlock(i + start_layer, args, dtype))
+                for i in range(curr_rank_layers)
+            ]
         )
-        self.freqs_cis = precompute_freqs_cis(
-            args.dim // args.n_heads, args.max_seq_len * 2
+        self.freqs_cis = reshape_for_broadcast(
+            precompute_freqs(args.dim // args.n_heads, args.max_seq_len),
+            torch.empty(
+                (
+                    1,
+                    args.max_seq_len,
+                    args.n_heads // tp_world,
+                    args.dim // args.n_heads // 2,
+                    2,
+                ),
+                dtype=dtype,
+            ),
         )
 
         if pp_rank == 0:
@@ -365,7 +449,7 @@ def main():
     torch.cuda.set_device(local_rank)
 
     tensor_model_parallel_size = 8
-    pipeline_model_parallel_size = 4
+    pipeline_model_parallel_size = 2
     virtual_pipeline_model_parallel_size = None
 
     parallel_state.initialize_model_parallel(
@@ -410,13 +494,21 @@ def main():
 
     local_rank = torch.cuda.current_device()
 
-    optimizer = DistributedFusedAdam(
-        models[0].parameters(),
-        lr=1e-4,
-        process_group=parallel_state.get_data_parallel_group(),
-    )
+    # optimizer = DistributedFusedAdam(
+    #     models[0].parameters(),
+    #     lr=1e-4,
+    #     process_group=parallel_state.get_data_parallel_group(),
+    #     store_params=False,  # disable sharded param store
+    # )
+
+    optimizer = torch.optim.AdamW(models[0].parameters(), lr=1e-4)
+
     data_loader = (
-        torch.randint(0, llama_args.vocab_size, (100, global_batch_size, llama_args.max_seq_len + 1))
+        torch.randint(
+            0,
+            llama_args.vocab_size,
+            (100, global_batch_size, llama_args.max_seq_len + 1),
+        )
         .long()
         .cuda()
     )
@@ -445,6 +537,8 @@ def main():
             print(
                 f"tflops: {approx_model_flops / (dt * world_size) / 1e12=}", flush=True
             )
+            memory_usage_gb = torch.cuda.max_memory_allocated() / 1e9
+            print(f"memory usage: {memory_usage_gb=}", flush=True)
             print(f"{loss=}", flush=True)
         optimizer.step()
 
