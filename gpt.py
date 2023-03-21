@@ -364,6 +364,13 @@ class SplitLlama(nn.Module):
         self.pp_rank = pp_rank
         self.pp_world = pp_world
 
+    # factored out for torch.compile
+    @torch.compile
+    def _run_layers(self, x, start_pos, freqs_cis, mask):
+        for layer in self.layers:
+            x = layer(x, start_pos, freqs_cis, mask)
+        return x
+
     def forward(self, tokens_or_hidden_state: torch.Tensor, start_pos: int):
         if self.pp_rank == 0:
             x = self.tok_embeddings(tokens_or_hidden_state)
@@ -375,8 +382,10 @@ class SplitLlama(nn.Module):
         mask = torch.full((1, 1, seq_len, seq_len), float("-inf"), device=x.device)
         mask = torch.triu(mask, diagonal=start_pos + 1).type_as(x)
         freqs_cis = self.freqs_cis[start_pos : start_pos + seq_len].to(x.device)
-        for layer in self.layers:
-            x = layer(x, start_pos, freqs_cis, mask)
+        # for layer in self.layers:
+        #     x = layer(x, start_pos, freqs_cis, mask)
+
+        x = self._run_layers(x, start_pos, freqs_cis, mask)
 
         if self.pp_rank == self.pp_world - 1:
             x = self.norm(x)
@@ -539,6 +548,8 @@ def main():
             )
             memory_usage_gb = torch.cuda.max_memory_allocated() / 1e9
             print(f"memory usage: {memory_usage_gb=}", flush=True)
+            samples_per_sec = global_batch_size / dt
+            print(f"throughput: {samples_per_sec=}", flush=True)
             print(f"{loss=}", flush=True)
         optimizer.step()
 
