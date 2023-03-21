@@ -1,6 +1,5 @@
 import os
-
-from time import sleep
+import time
 from typing import List, Tuple, Optional
 import math
 from dataclasses import dataclass
@@ -21,7 +20,11 @@ from apex.transformer.pipeline_parallel.utils import (
     average_losses_across_data_parallel_group,
     setup_microbatch_calculator,
 )
+from apex.contrib.optimizers.distributed_fused_adam import DistributedFusedAdam
 
+import torch._dynamo
+torch._dynamo.allow_in_graph(rearrange)
+torch._dynamo.allow_in_graph(tensor_parallel.layers.linear_with_grad_accumulation_and_async_allreduce)
 
 class PipelineStage(nn.Module):
     input_tensors: Optional[List[torch.Tensor]] = None
@@ -52,22 +55,22 @@ class ModelArgs:
     norm_eps: float = 1e-5
 
     max_batch_size: int = 32
-    max_seq_len: int = 2048
+    max_seq_len: int = 4096
+
 
 class RMSNorm(torch.nn.Module):
-    
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6, dtype=torch.float32):
         super().__init__()
         self.eps = torch.tensor(eps)
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.ones(dim, dtype=dtype))
 
     @torch.compile
-    def _norm(self, x, eps):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+    def _norm(self, x, eps, weight):
+        out = x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps).type_as(x)
+        return out * weight
 
     def forward(self, x):
-        output = self._norm(x.float(), self.eps).type_as(x)
-        return output * self.weight
+        return self._norm(x, self.eps, self.weight)
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
@@ -101,6 +104,7 @@ def apply_rotary_emb(
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
+torch._dynamo.allow_in_graph(apply_rotary_emb)
 
 def add_bias(x: Tuple[torch.tensor, Optional[torch.Tensor]]):
     x, bias = x
@@ -110,7 +114,7 @@ def add_bias(x: Tuple[torch.tensor, Optional[torch.Tensor]]):
 
 
 class Attention(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, dtype: torch.dtype = torch.float32):
         super().__init__()
         tp_size = parallel_state.get_tensor_model_parallel_world_size()
         assert args.n_heads % tp_size == 0
@@ -123,6 +127,7 @@ class Attention(nn.Module):
             bias=False,
             gather_output=False,
             init_method=lambda x: x,
+            params_dtype=dtype
         )
         self.wk = tensor_parallel.ColumnParallelLinear(
             args.dim,
@@ -130,6 +135,7 @@ class Attention(nn.Module):
             bias=False,
             gather_output=False,
             init_method=lambda x: x,
+            params_dtype=dtype
         )
         self.wv = tensor_parallel.ColumnParallelLinear(
             args.dim,
@@ -137,6 +143,7 @@ class Attention(nn.Module):
             bias=False,
             gather_output=False,
             init_method=lambda x: x,
+            params_dtype=dtype
         )
         self.wo = tensor_parallel.RowParallelLinear(
             args.n_heads * self.head_dim,
@@ -144,14 +151,8 @@ class Attention(nn.Module):
             bias=False,
             input_is_parallel=True,
             init_method=lambda x: x,
+            params_dtype=dtype
         )
-
-        self.cache_k = torch.zeros(
-            (args.max_batch_size, args.max_seq_len, self.n_local_heads, self.head_dim)
-        ).cuda()
-        self.cache_v = torch.zeros(
-            (args.max_batch_size, args.max_seq_len, self.n_local_heads, self.head_dim)
-        ).cuda()
 
     def forward(
         self,
@@ -204,19 +205,20 @@ class FeedForward(nn.Module):
         dim: int,
         hidden_dim: int,
         multiple_of: int,
+        dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
         hidden_dim = int(2 * hidden_dim / 3)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
         self.w1 = tensor_parallel.ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x, params_dtype=dtype
         )
         self.w2 = tensor_parallel.RowParallelLinear(
-            hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
+            hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x, params_dtype=dtype
         )
         self.w3 = tensor_parallel.ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x, params_dtype=dtype
         )
 
     def forward(self, x):
@@ -224,18 +226,18 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, layer_id: int, args: ModelArgs):
+    def __init__(self, layer_id: int, args: ModelArgs, dtype: torch.dtype):
         super().__init__()
         self.n_heads = args.n_heads
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
-        self.attention = Attention(args)
+        self.attention = Attention(args, dtype=dtype)
         self.feed_forward = FeedForward(
-            dim=args.dim, hidden_dim=4 * args.dim, multiple_of=args.multiple_of
+            dim=args.dim, hidden_dim=4 * args.dim, multiple_of=args.multiple_of, dtype=dtype
         )
         self.layer_id = layer_id
-        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
-        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps, dtype=dtype)
+        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps, dtype=dtype)
 
     def forward(
         self,
@@ -249,53 +251,8 @@ class TransformerBlock(nn.Module):
         return out
 
 
-class Llama(nn.Module):
-    def __init__(self, params: ModelArgs):
-        super().__init__()
-        self.params = params
-        self.vocab_size = params.vocab_size
-        self.n_layers = params.n_layers
-
-        self.tok_embeddings = tensor_parallel.VocabParallelEmbedding(
-            params.vocab_size, params.dim
-        )
-
-        self.layers = torch.nn.ModuleList()
-        for layer_id in range(params.n_layers):
-            self.layers.append(TransformerBlock(layer_id, params))
-
-        self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-        self.output = tensor_parallel.ColumnParallelLinear(
-            params.dim, params.vocab_size, bias=False
-        )
-
-        self.freqs_cis = precompute_freqs_cis(
-            self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
-        )
-
-    @torch.inference_mode()
-    def forward(self, tokens: torch.Tensor, start_pos: int):
-        _bsz, seqlen = tokens.shape
-        h = self.tok_embeddings(tokens)
-        self.freqs_cis = self.freqs_cis.to(h.device)
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
-
-        mask = None
-        if seqlen > 1:
-            mask = torch.full(
-                (1, 1, seqlen, seqlen), float("-inf"), device=tokens.device
-            )
-            mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
-
-        for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
-        h = self.norm(h)
-        output = self.output(h[:, -1, :])  # only compute last logits
-        return output.float(), h
-
-
 class SplitLlama(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, dtype: torch.dtype = torch.float32):
         super().__init__()
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         pp_world = parallel_state.get_pipeline_model_parallel_world_size()
@@ -303,7 +260,7 @@ class SplitLlama(nn.Module):
         start_layer = pp_rank * curr_rank_layers
 
         self.layers = nn.ModuleList(
-            [TransformerBlock(i + start_layer, args) for i in range(curr_rank_layers)]
+            [TransformerBlock(i + start_layer, args, dtype) for i in range(curr_rank_layers)]
         )
         self.freqs_cis = precompute_freqs_cis(
             args.dim // args.n_heads, args.max_seq_len * 2
@@ -311,12 +268,12 @@ class SplitLlama(nn.Module):
 
         if pp_rank == 0:
             self.tok_embeddings = tensor_parallel.VocabParallelEmbedding(
-                args.vocab_size, args.dim
+                args.vocab_size, args.dim, params_dtype=dtype
             )
 
         if pp_rank == pp_world - 1:
             self.output = tensor_parallel.ColumnParallelLinear(
-                args.dim, args.vocab_size, bias=False
+                args.dim, args.vocab_size, bias=False, params_dtype=dtype
             )
             self.norm = RMSNorm(args.dim, eps=args.norm_eps)
 
@@ -346,7 +303,7 @@ class SplitLlama(nn.Module):
 
 
 def model_provider_func(llama_args, *args, **kwargs):
-    return PipelineStage(SplitLlama(llama_args)).half()
+    return PipelineStage(SplitLlama(llama_args, dtype=torch.bfloat16))
 
 
 def loss_func(pred, label):
@@ -360,12 +317,15 @@ def loss_func(pred, label):
 
 def forward_step_func(batch, model):
     input, label = batch
+    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    # print(pp_rank, tp_rank, input.shape, label.shape, input.dtype, flush=True)
     out = model(input, start_pos=0)
-
+    # print(pp_rank, tp_rank, out.shape, out.dtype, flush=True)
     return out.contiguous(), lambda pred: loss_func(pred.float(), label)
 
 
-# from
+# from apex
 def set_random_seed(seed: int):
     """Set random seed for reproducability."""
     # Ensure that different pipeline MP stages get different seeds.
@@ -378,24 +338,20 @@ def set_random_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.device_count() > 0:
-        tensor_parallel.model_parallel_cuda_manual_seed(seed)
+    tensor_parallel.model_parallel_cuda_manual_seed(seed)
 
-
-import logging
-
-# logging.basicConfig(level=logging.DEBUG)
-
-import torch.distributed.elastic.multiprocessing.errors
 
 params = {
     65: ModelArgs(dim=8192, n_heads=64, n_layers=80, vocab_size=50432, norm_eps=1e-5),
     # 30: ModelArgs(dim=6656, n_heads=52, n_layers=60, vocab_size=50432, norm_eps=1e-6),
     30: ModelArgs(dim=8192, n_heads=64, n_layers=40, vocab_size=50432, norm_eps=1e-6),
+    15: ModelArgs(dim=8192, n_heads=64, n_layers=20, vocab_size=50432, norm_eps=1e-6),
 }
 
+# import logging
+# logging.basicConfig(level=logging.DEBUG)
 
-@torch.distributed.elastic.multiprocessing.errors.record
+
 def main():
     rank = int(os.environ["SLURM_PROCID"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -409,7 +365,7 @@ def main():
     torch.cuda.set_device(local_rank)
 
     tensor_model_parallel_size = 8
-    pipeline_model_parallel_size = 1
+    pipeline_model_parallel_size = 4
     virtual_pipeline_model_parallel_size = None
 
     parallel_state.initialize_model_parallel(
@@ -427,7 +383,7 @@ def main():
     micro_batch_size = 1
 
     setup_microbatch_calculator(
-        rank=parallel_state.get_tensor_model_parallel_rank(),
+        rank=rank,
         rampup_batch_size=None,
         global_batch_size=global_batch_size,
         micro_batch_size=micro_batch_size,
@@ -441,7 +397,7 @@ def main():
     )
     print(f"{forward_backward_func=}")
 
-    llama_args = params[30]
+    llama_args = params[65]
     model_kwargs = dict(llama_args=llama_args)
     wrap_with_ddp = True
 
@@ -454,16 +410,22 @@ def main():
 
     local_rank = torch.cuda.current_device()
 
-    optimizer = torch.optim.AdamW(models[0].parameters(), lr=0.01)
+    optimizer = DistributedFusedAdam(
+        models[0].parameters(),
+        lr=1e-4,
+        process_group=parallel_state.get_data_parallel_group(),
+    )
     data_loader = (
-        torch.randint(0, llama_args.vocab_size, (100, global_batch_size, 2049))
+        torch.randint(0, llama_args.vocab_size, (100, global_batch_size, llama_args.max_seq_len + 1))
         .long()
         .cuda()
     )
 
     io_shape = (llama_args.max_seq_len, micro_batch_size, llama_args.dim)
-    approx_model_flops = 8 * global_batch_size * llama_args.max_seq_len * 32.5e9
-    import time
+    approx_model_flops = 8 * global_batch_size * llama_args.max_seq_len * 65e9
+
+    if rank == 0:
+        print(f"start {io_shape}", flush=True)
 
     for batch in data_loader:
         optimizer.zero_grad()
@@ -475,10 +437,11 @@ def main():
             models,
             forward_only=False,
             tensor_shape=io_shape,
+            dtype=torch.bfloat16,
         )
 
         dt = time.time() - t
-        if rank == 0:
+        if rank == (world_size - 1):
             print(
                 f"tflops: {approx_model_flops / (dt * world_size) / 1e12=}", flush=True
             )
