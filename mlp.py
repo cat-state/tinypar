@@ -57,8 +57,7 @@ class ParallelLinear(nn.Module):
         super().__init__()
 
         no_async_tensor_model_parallel_allreduce = (
-            parallel_state.get_tensor_model_parallel_world_size() == 1
-            or sequence_parallel
+            parallel_state.get_tensor_model_parallel_world_size() == 1 or sequence_parallel
         )
 
         if in_size < out_size:
@@ -154,9 +153,7 @@ def set_random_seed(seed_):
 
 
 def main():
-    print(
-        f"{os.environ['LOCAL_RANK']=} {os.environ['RANK']=} {os.environ['WORLD_SIZE']=}"
-    )
+    print(f"{os.environ['LOCAL_RANK']=} {os.environ['RANK']=} {os.environ['WORLD_SIZE']=}")
     torch.distributed.init_process_group(
         backend="nccl",
         init_method=f"file:///mnt/nvme/home/uwu/nccl.sock",
