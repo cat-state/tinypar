@@ -24,6 +24,7 @@ from apex.contrib.optimizers.distributed_fused_adam import DistributedFusedAdam
 from apex.optimizers.fused_adam import FusedAdam
 
 from datasets import load_dataset
+import wandb
 
 import torch._dynamo
 
@@ -33,10 +34,8 @@ torch._dynamo.allow_in_graph(rearrange)
 def identity(x):
     return x
 
-
 # torch.compile = identity
 # torch._dynamo.config.cache_size_limit = 1000
-
 
 @dataclass
 class ModelArgs:
@@ -339,7 +338,7 @@ class SplitLlama(nn.Module):
         q_shape = (batch_size, total_seq_len, self.args.n_heads, head_dim // 2, 2)
         kv_freqs = reshape_for_broadcast(kv_freqs, kv_shape).to(x.device)
         q_freqs = reshape_for_broadcast(q_freqs, q_shape).to(x.device)
-        x = self.transformer_block(x, start_pos, kv_freqs, q_freqs, mask)
+        x = self.transformer_block(x, start_pos, kv_freqs, q_freqs, mask=None)
 
         if self.pp_rank == self.pp_world - 1:
             x = self.norm(x)
@@ -602,6 +601,15 @@ def main():
     tok = Tokenizer("/mnt/hdd/llama2/tokenizer.model")
     llama_args = ModelArgs(**dict(params[65].__dict__, vocab_size=tok.n_words))
 
+    if rank == (world_size - 1):
+        wandb.init(
+            project="tinypar",
+            entity="uwu1",
+            name="llama",
+            config=llama_args.__dict__,
+        )
+
+
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
     pp_rank = parallel_state.get_pipeline_model_parallel_rank()
 
@@ -618,8 +626,8 @@ def main():
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    global_batch_size = 16
-    micro_batch_size = 1
+    global_batch_size = 2048
+    micro_batch_size = 2
 
     setup_microbatch_calculator(
         rank=rank,
@@ -655,8 +663,8 @@ def main():
 
     optimizer = DistributedFusedAdam(
         models[0].parameters(),
-        lr=1e-6 * (2048 / 128),
-        weight_decay=0.0,
+        lr=1e-6 * (global_batch_size / 128),
+        weight_decay=0,
         process_group=parallel_state.get_data_parallel_group(),
         dtype=torch.bfloat16,
         # distributed_process_group=torch.distributed.new_group(ranks=[torch.distributed.get_rank()]),
@@ -665,11 +673,17 @@ def main():
     )
 
     dp_rank = parallel_state.get_data_parallel_rank()
-
+    tp_group = parallel_state.get_tensor_model_parallel_group()
     data = packed_dataset(tok, "tatsu-lab/alpaca")
-
+    total_params_for_rank = sum(p.numel() for p in models[0].parameters())
+    total_params_world = torch.tensor(total_params_for_rank).cuda()
+    torch.distributed.all_reduce(total_params_world, op=torch.distributed.ReduceOp.SUM)
+    total_params = total_params_world.item() / data_parallel_size
+    if rank == 0:
+        print(f"total params: {total_params}", flush=True)
+    
     io_shape = (llama_args.max_seq_len, micro_batch_size, llama_args.dim)
-    approx_model_flops = 8 * global_batch_size * llama_args.max_seq_len * 30e9
+    approx_model_flops = 8 * global_batch_size * llama_args.max_seq_len * total_params
 
     if rank == 0:
         print(f"start {io_shape}", flush=True)
@@ -680,7 +694,6 @@ def main():
     for batch in sample_random_chunks(data, llama_args.max_seq_len + 1, global_batch_size):
         optimizer.zero_grad()
         batch = batch.to(local_rank)
-        print(batch.shape)
         inputs, labels = batch[:, :-1], batch[:, 1:]
         t = time.time()
         loss = forward_backward_func(
@@ -690,6 +703,7 @@ def main():
             forward_only=False,
             tensor_shape=io_shape,
             dtype=torch.bfloat16,
+            async_comm=True,
             sync_batch_comm=False,
             sequence_parallel_enabled=True,
         )
@@ -702,6 +716,15 @@ def main():
             samples_per_sec = global_batch_size / dt
             print(f"throughput: {samples_per_sec=}", flush=True)
             print(f"{len(loss)=}", flush=True)
+            loss = [d["nice_loss"] for d in loss]
+            mean_loss = torch.mean(torch.stack(loss).detach())
+            print(f"{mean_loss=}", flush=True)
+            wandb.log(dict(
+                loss=mean_loss.item(),
+                throughput=samples_per_sec,
+                memory_usage=memory_usage_gb,
+                tflops=approx_model_flops / (dt * world_size) / 1e12,
+            ))
 
         rmsnorms = [m for _, m in models[0].named_modules() if isinstance(m, RMSNorm)]
         rmsnorm_grads = [param.grad for rmsnorm in rmsnorms for param in rmsnorm.parameters()]
@@ -722,8 +745,8 @@ def main():
             break
 
         if step % 100 == 0:
-            print(f"{step=}", flush=True)
-            inference(
+            # print(f"{step=}", flush=True)
+            '''inference(
                 models,
                 tok,
                 "Below is an instruction that describes a task,",
@@ -731,18 +754,18 @@ def main():
                 micro_batch_size,
                 rank,
                 forward_backward_func,
-            )
+            )'''
 
         step += 1
 
     print("done", flush=True)
-    torch.disstributed.barrier()
+    torch.distributed.barrier()
     if rank < (tensor_model_parallel_size * pipeline_model_parallel_size):
         # save the state dict to sharded files
         os.makedirs(f"/mnt/hdd/alpaca-llama2/65B", exist_ok=True)
         torch.save(
             models[0].state_dict(),
-            f"/mnt/hdd/alpaca-llama2/65B/consolidated.{tp_rank:02d}.pth",
+            f"/mnt/hdd/alpaca-llama2/65B/tp-consolidated.{tp_rank:02d}.pth",
         )
 
 if __name__ == "__main__":
