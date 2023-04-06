@@ -23,6 +23,7 @@ from apex.transformer.pipeline_parallel.utils import (
 from apex.contrib.optimizers.distributed_fused_adam import DistributedFusedAdam
 from apex.optimizers.fused_adam import FusedAdam
 
+from datasets import load_dataset
 
 import torch._dynamo
 
@@ -34,7 +35,7 @@ def identity(x):
 
 
 # torch.compile = identity
-torch._dynamo.config.cache_size_limit = 1000
+# torch._dynamo.config.cache_size_limit = 1000
 
 
 @dataclass
@@ -498,6 +499,79 @@ class Tokenizer:
         return self.sp_model.decode(t)
 
 
+def packed_dataset(tokenier, dataset: str):
+    ds = load_dataset(dataset, split="train")
+    ds = ds.map(lambda x: {"text": tokenier.encode(x["text"], bos=False, eos=True)})
+    flattened = torch.tensor([x for y in ds["text"] for x in y])
+    return flattened
+
+def sample_random_chunks(data, chunk_size, batch_size):
+    data_len = len(data)
+    chunk_size = min(data_len, chunk_size)
+    while True:
+        idxes = torch.randint(0, data_len - chunk_size, (batch_size,))
+        chunks = torch.stack([data[i : i + chunk_size] for i in idxes])
+        yield chunks
+
+def inference(models, tok, text, llama_args, micro_batch_size, rank, forward_backward_func):
+
+    prompt = [tok.encode(text, bos=False, eos=False)]
+    prompt_lengths = [len(p) for p in prompt]
+    prompt = [p + [tok.eos_id] * (len(p) - llama_args.max_seq_len) for p in prompt]
+    prompt = torch.tensor(prompt).long().cuda()
+
+    _reconfigure_microbatch_calculator(
+        rank=rank,
+        rampup_batch_size=None,
+        global_batch_size=micro_batch_size,
+        micro_batch_size=micro_batch_size,
+        data_parallel_size=1,
+    )
+
+    with torch.no_grad():
+        for i in range(100):
+            output = forward_backward_func(
+                inference_forward_step_func,
+                [prompt],
+                models,
+                forward_only=True,
+                tensor_shape=(prompt.shape[1], 1, llama_args.dim),
+                dtype=torch.bfloat16,
+            )
+
+            if parallel_state.is_pipeline_last_stage():
+                logits = output[0]["logits"].float()
+                logits = rearrange(logits, "s b n -> b s n")
+                logits = tensor_parallel.gather_from_tensor_model_parallel_region(
+                    logits
+                )
+                prompt = torch.cat([prompt, logits[:, -1:].argmax(dim=-1)], dim=1)
+                src = parallel_state.get_pipeline_model_parallel_last_rank()
+                group = parallel_state.get_embedding_group()
+                torch.distributed.broadcast(prompt, src, group)
+            elif parallel_state.is_pipeline_first_stage():
+                new_prompt = torch.empty(
+                    (prompt.shape[0], prompt.shape[1] + 1),
+                    dtype=prompt.dtype,
+                    device=prompt.device,
+                )
+                src = parallel_state.get_pipeline_model_parallel_last_rank()
+                group = parallel_state.get_embedding_group()
+                torch.distributed.broadcast(new_prompt, src, group)
+                prompt = new_prompt
+
+            if rank == 0:
+                text_output = tok.decode(prompt[0].cpu().numpy().tolist())
+                print(text_output)
+
+    _reconfigure_microbatch_calculator(
+        rank=rank,
+        rampup_batch_size=None,
+        global_batch_size=global_batch_size,
+        micro_batch_size=micro_batch_size,
+        data_parallel_size=data_parallel_size,
+    )
+
 def main():
     rank = int(os.environ["SLURM_PROCID"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -510,7 +584,7 @@ def main():
     local_rank = rank - gpus_per_node * (rank // gpus_per_node)
     torch.cuda.set_device(local_rank)
 
-    tensor_model_parallel_size = 4
+    tensor_model_parallel_size = 8
     pipeline_model_parallel_size = 1
     virtual_pipeline_model_parallel_size = None
 
@@ -525,27 +599,26 @@ def main():
         tensor_model_parallel_size * pipeline_model_parallel_size
     )
 
-    # tok = Tokenizer("/mnt/hdd/llama2/tokenizer.model")
-    # llama_args = ModelArgs(**dict(params[65].__dict__, vocab_size=tok.n_words))
-    llama_args = ModelArgs(**dict(params[30].__dict__, vocab_size=32000))
+    tok = Tokenizer("/mnt/hdd/llama2/tokenizer.model")
+    llama_args = ModelArgs(**dict(params[65].__dict__, vocab_size=tok.n_words))
 
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
     pp_rank = parallel_state.get_pipeline_model_parallel_rank()
 
-    # state_dict = torch.load(f"/mnt/hdd/llama2/65B/consolidated.{tp_rank:02d}.pth")
-    # state_dict = convert_llama_state_dict(
-    #     llama_args,
-    #     state_dict,
-    #     tp_rank,
-    #     tensor_model_parallel_size,
-    #     pp_rank,
-    #     pipeline_model_parallel_size,
-    # )
+    state_dict = torch.load(f"/mnt/hdd/llama2/65B/consolidated.{tp_rank:02d}.pth")
+    state_dict = convert_llama_state_dict(
+        llama_args,
+        state_dict,
+        tp_rank,
+        tensor_model_parallel_size,
+        pp_rank,
+        pipeline_model_parallel_size,
+    )
 
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    global_batch_size = 2048
+    global_batch_size = 16
     micro_batch_size = 1
 
     setup_microbatch_calculator(
@@ -573,8 +646,8 @@ def main():
         **model_kwargs,
     )
 
-    # models[0].load_state_dict(state_dict)
-    # print("loaded state dict", flush=True)
+    models[0].load_state_dict(state_dict)
+    print("loaded state dict", flush=True)
 
     local_rank = torch.cuda.current_device()
 
@@ -582,7 +655,8 @@ def main():
 
     optimizer = DistributedFusedAdam(
         models[0].parameters(),
-        lr=1e-4,
+        lr=1e-6 * (2048 / 128),
+        weight_decay=0.0,
         process_group=parallel_state.get_data_parallel_group(),
         dtype=torch.bfloat16,
         # distributed_process_group=torch.distributed.new_group(ranks=[torch.distributed.get_rank()]),
@@ -590,37 +664,9 @@ def main():
         store_params=False,
     )
 
-    # optimizer = FusedAdam(models[0].parameters(), lr=1e-4)
-
     dp_rank = parallel_state.get_data_parallel_rank()
 
-    data_loader = (
-        torch.randint(
-            0,
-            llama_args.vocab_size,
-            (100, global_batch_size, llama_args.max_seq_len + 1),
-        )
-        .long()
-        .cuda()
-    )
-
-    data_loader = (
-        torch.full(
-            (100, global_batch_size, llama_args.max_seq_len + 1),
-            fill_value=dp_rank,
-        )
-        .long()
-        .cuda()
-    )
-
-    data_loader = (
-        torch.arange(0, 100 * global_batch_size, dtype=torch.long)
-        .repeat(llama_args.max_seq_len + 1)
-        .reshape(100, global_batch_size, llama_args.max_seq_len + 1)
-        .cuda()
-        * 10
-        + dp_rank
-    )
+    data = packed_dataset(tok, "tatsu-lab/alpaca")
 
     io_shape = (llama_args.max_seq_len, micro_batch_size, llama_args.dim)
     approx_model_flops = 8 * global_batch_size * llama_args.max_seq_len * 30e9
@@ -628,66 +674,13 @@ def main():
     if rank == 0:
         print(f"start {io_shape}", flush=True)
 
-    # prompt = [tok.encode("Hello world, my name is", bos=True, eos=False)]
-    # prompt_lengths = [len(p) for p in prompt]
-    # prompt = [p + [tok.eos_id] * (len(p) - llama_args.max_seq_len) for p in prompt]
-    # prompt = torch.tensor(prompt).long().cuda()
-
-    # _reconfigure_microbatch_calculator(
-    #     rank=rank,
-    #     rampup_batch_size=None,
-    #     global_batch_size=micro_batch_size,
-    #     micro_batch_size=micro_batch_size,
-    #     data_parallel_size=1,
-    # )
-
-    # with torch.no_grad():
-    #     for i in range(100):
-    #         output = forward_backward_func(
-    #             inference_forward_step_func,
-    #             [prompt],
-    #             models,
-    #             forward_only=True,
-    #             tensor_shape=(prompt.shape[1], 1, llama_args.dim),
-    #             dtype=torch.bfloat16,
-    #         )
-
-    #         if parallel_state.is_pipeline_last_stage():
-    #             logits = output[0]["logits"].float()
-    #             logits = rearrange(logits, "s b n -> b s n")
-    #             logits = tensor_parallel.gather_from_tensor_model_parallel_region(
-    #                 logits
-    #             )
-    #             prompt = torch.cat([prompt, logits[:, -1:].argmax(dim=-1)], dim=1)
-    #             src = parallel_state.get_pipeline_model_parallel_last_rank()
-    #             group = parallel_state.get_embedding_group()
-    #             torch.distributed.broadcast(prompt, src, group)
-    #         elif parallel_state.is_pipeline_first_stage():
-    #             new_prompt = torch.empty(
-    #                 (prompt.shape[0], prompt.shape[1] + 1),
-    #                 dtype=prompt.dtype,
-    #                 device=prompt.device,
-    #             )
-    #             src = parallel_state.get_pipeline_model_parallel_last_rank()
-    #             group = parallel_state.get_embedding_group()
-    #             torch.distributed.broadcast(new_prompt, src, group)
-    #             prompt = new_prompt
-
-    #         if rank == 0:
-    #             text_output = tok.decode(prompt[0].cpu().numpy().tolist())
-    #             print(text_output)
-
-    # return
-    # _reconfigure_microbatch_calculator(
-    #     rank=rank,
-    #     rampup_batch_size=None,
-    #     global_batch_size=global_batch_size,
-    #     micro_batch_size=micro_batch_size,
-    #     data_parallel_size=data_parallel_size,
-    # )
-
-    for batch in data_loader:
+    total_samples = 50000 * 5
+    total_steps = total_samples // global_batch_size
+    step = 0
+    for batch in sample_random_chunks(data, llama_args.max_seq_len + 1, global_batch_size):
         optimizer.zero_grad()
+        batch = batch.to(local_rank)
+        print(batch.shape)
         inputs, labels = batch[:, :-1], batch[:, 1:]
         t = time.time()
         loss = forward_backward_func(
@@ -725,8 +718,32 @@ def main():
 
         optimizer.step()
 
-    print("done", flush=True)
+        if step >= total_steps:
+            break
 
+        if step % 100 == 0:
+            print(f"{step=}", flush=True)
+            inference(
+                models,
+                tok,
+                "Below is an instruction that describes a task,",
+                llama_args,
+                micro_batch_size,
+                rank,
+                forward_backward_func,
+            )
+
+        step += 1
+
+    print("done", flush=True)
+    torch.disstributed.barrier()
+    if rank < (tensor_model_parallel_size * pipeline_model_parallel_size):
+        # save the state dict to sharded files
+        os.makedirs(f"/mnt/hdd/alpaca-llama2/65B", exist_ok=True)
+        torch.save(
+            models[0].state_dict(),
+            f"/mnt/hdd/alpaca-llama2/65B/consolidated.{tp_rank:02d}.pth",
+        )
 
 if __name__ == "__main__":
     main()

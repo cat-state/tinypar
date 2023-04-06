@@ -94,7 +94,7 @@ def add_bias(x: Tuple[torch.tensor, Optional[torch.Tensor]]):
     return x
 
 
-class NeoXAttention(nn.Module):
+class GPTNeoXAttention(nn.Module):
     def __init__(self, args: NeoXArgs, dtype: torch.dtype = torch.float32):
         super().__init__()
         tp_size = parallel_state.get_tensor_model_parallel_world_size()
@@ -130,14 +130,12 @@ class NeoXAttention(nn.Module):
         mask: Optional[torch.Tensor],
     ):
         seqlen, bsz, _ = x.shape
-        x = x.contiguous()
 
-        xq, xk, xv = add_bias(self.wq(x)), add_bias(self.wk(x)), add_bias(self.wv(x))
-        
+        x = x.contiguous()
         qkv = add_bias(self.query_key_value(x))
         qkv = rearrange(qkv, "s b (qkv hd) -> qkv s b hd", qkv=3)
 
-        xq, xk, xv = qkv[0], qkv[1], qkv[2]
+        xq, xk, xv = qkv.unbind(0)
 
         xk = apply_rotary_emb(xk, freqs=kv_freqs)
         xq = apply_rotary_emb(xq, freqs=q_freqs)
@@ -155,12 +153,7 @@ class NeoXAttention(nn.Module):
             return add_bias(self.wo(output))
 
 
-@torch.compile
-def gated_silu(x, gate):
-    return F.silu(x) * gate
-
-
-class FeedForward(nn.Module):
+class GPTNeoXMLP(nn.Module):
     def __init__(
         self,
         dim: int,
@@ -179,6 +172,7 @@ class FeedForward(nn.Module):
             sequence_parallel_enabled=True,
             no_async_tensor_model_parallel_allreduce=True,
         )
+
         self.dense_4h_to_h = tensor_parallel.RowParallelLinear(
             hidden_dim,
             dim,
@@ -188,7 +182,7 @@ class FeedForward(nn.Module):
             params_dtype=dtype,
             sequence_parallel_enabled=True,
         )
-       
+
     def forward(self, x):
         return self.dense_4h_to_h(F.gelu(self.dense_h_to_4h(x)))
 
@@ -196,15 +190,15 @@ class FeedForward(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, layer_id: int, args: NeoXArgs, dtype: torch.dtype):
         super().__init__()
-        self.attention = NeoXAttention(args, dtype=dtype)
-        self.feed_forward = FeedForward(
+        self.attention = GPTNeoXAttention(args, dtype=dtype)
+        self.mlp = GPTNeoXMLP(
             dim=args.hidden_size,
             hidden_dim=args.intermediate_size,
             dtype=dtype,
         )
         self.layer_id = layer_id
-        self.attention_norm = nn.LayerNorm(args.hidden_size, eps=args.layer_norm_eps)
-        self.ffn_norm = nn.LayerNorm(args.hidden_size, eps=args.layer_norm_eps)
+        self.post_attention_layernorm = nn.LayerNorm(args.hidden_size, eps=args.layer_norm_eps)
+        self.input_layernorm = nn.LayerNorm(args.hidden_size, eps=args.layer_norm_eps)
 
     def forward(
         self,
@@ -214,12 +208,15 @@ class TransformerBlock(nn.Module):
         q_freqs: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
-        h = x + self.attention(self.attention_norm(x), start_pos, kv_freqs, q_freqs, mask)
-        out = h + self.feed_forward(self.ffn_norm(h))
-        return out
+        x0 = self.input_layernorm(x)
+        x1 = self.post_attention_layernorm(x)
+        return x + self.attention(x0, start_pos, kv_freqs, q_freqs, mask) + self.feed_forward(x1)
 
 
-class SplitLlama(nn.Module):
+
+
+
+class SplitNeoX(nn.Module):
     def __init__(self, args: NeoXArgs, dtype: torch.dtype = torch.float32):
         super().__init__()
         self.pp_rank = parallel_state.get_pipeline_model_parallel_rank()
@@ -236,13 +233,13 @@ class SplitLlama(nn.Module):
         self.freqs = precompute_freqs(args.dim // args.n_heads, args.max_seq_len * 2)
 
         if self.pp_rank == 0:
-            self.tok_embeddings = tensor_parallel.VocabParallelEmbedding(
+            self.embed_in = tensor_parallel.VocabParallelEmbedding(
                 args.vocab_size, args.dim, params_dtype=dtype
             )
 
         if self.pp_rank == self.pp_world - 1:
-            self.output = tensor_parallel.ColumnParallelLinear(
-                args.dim,
+            self.embed_output = tensor_parallel.ColumnParallelLinear(
+                args.hidden_size,
                 args.vocab_size,
                 bias=False,
                 params_dtype=dtype,
@@ -250,7 +247,7 @@ class SplitLlama(nn.Module):
                 sequence_parallel_enabled=True,
                 no_async_tensor_model_parallel_allreduce=True,
             )
-            self.norm = nn.LayerNorm(args.dim, eps=args.layer_norm_eps)
+            self.final_layer_norm = nn.LayerNorm(args.dim, eps=args.layer_norm_eps)
 
         self.args = args
 
@@ -263,7 +260,7 @@ class SplitLlama(nn.Module):
 
     def forward(self, tokens_or_hidden_state: torch.Tensor, start_pos: int):
         if self.pp_rank == 0:
-            x = self.tok_embeddings(tokens_or_hidden_state)
+            x = self.embed_in(tokens_or_hidden_state)
             x = rearrange(x, "b s d -> s b d")
             x = tensor_parallel.mappings.scatter_to_sequence_parallel_region(x)
         else:
@@ -278,14 +275,15 @@ class SplitLlama(nn.Module):
         kv_freqs = self.freqs[start_pos : start_pos + total_seq_len].to(x.device)
         sp_n_queries = seq_len // self.tp_world
         q_freqs = kv_freqs
-        
+
         n_heads = self.args.num_attention_heads
         head_dim = self.args.hidden_size // n_heads
         kv_shape = (batch_size, total_seq_len, n_heads, head_dim // 2, 2)
         q_shape = (batch_size, total_seq_len, n_heads, head_dim // 2, 2)
         kv_freqs = reshape_for_broadcast(kv_freqs, kv_shape).to(x.device)
         q_freqs = reshape_for_broadcast(q_freqs, q_shape).to(x.device)
-        x = self.transformer_block(x, start_pos, kv_freqs, q_freqs, mask)
+
+        x = self.transformer_block(x, start_pos, kv_freqs, q_freqs, mask=None)
 
         if self.pp_rank == self.pp_world - 1:
             x = self.norm(x)
