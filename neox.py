@@ -32,7 +32,9 @@ torch._dynamo.allow_in_graph(rearrange)
 def identity(x):
     return x
 
+
 torch._dynamo.config.cache_size_limit = 1000
+
 
 @dataclass
 class NeoXArgs:
@@ -46,6 +48,7 @@ class NeoXArgs:
     intermediate_size: int = 2048
     hidden_act: str = "gelu"
     use_parallel_residual: bool = True
+
 
 def precompute_freqs(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
@@ -148,7 +151,9 @@ class GPTNeoXAttention(nn.Module):
         with torch.backends.cuda.sdp_kernel(
             enable_math=causal, enable_flash=True, enable_mem_efficient=False
         ):
-            output = F.scaled_dot_product_attention(xq, xk, xv, is_causal=causal, mask=mask)
+            output = F.scaled_dot_product_attention(
+                xq, xk, xv, is_causal=causal, mask=mask
+            )
             output = rearrange(output, "b nh s hd -> s b (nh hd)").contiguous()
             return add_bias(self.wo(output))
 
@@ -197,7 +202,9 @@ class TransformerBlock(nn.Module):
             dtype=dtype,
         )
         self.layer_id = layer_id
-        self.post_attention_layernorm = nn.LayerNorm(args.hidden_size, eps=args.layer_norm_eps)
+        self.post_attention_layernorm = nn.LayerNorm(
+            args.hidden_size, eps=args.layer_norm_eps
+        )
         self.input_layernorm = nn.LayerNorm(args.hidden_size, eps=args.layer_norm_eps)
 
     def forward(
@@ -210,10 +217,11 @@ class TransformerBlock(nn.Module):
     ):
         x0 = self.input_layernorm(x)
         x1 = self.post_attention_layernorm(x)
-        return x + self.attention(x0, start_pos, kv_freqs, q_freqs, mask) + self.feed_forward(x1)
-
-
-
+        return (
+            x
+            + self.attention(x0, start_pos, kv_freqs, q_freqs, mask)
+            + self.feed_forward(x1)
+        )
 
 
 class SplitNeoX(nn.Module):
@@ -228,7 +236,10 @@ class SplitNeoX(nn.Module):
         start_layer = self.pp_rank * curr_rank_layers
 
         self.layers = nn.ModuleList(
-            [TransformerBlock(i + start_layer, args, dtype) for i in range(curr_rank_layers)]
+            [
+                TransformerBlock(i + start_layer, args, dtype)
+                for i in range(curr_rank_layers)
+            ]
         )
         self.freqs = precompute_freqs(args.dim // args.n_heads, args.max_seq_len * 2)
 
@@ -252,7 +263,7 @@ class SplitNeoX(nn.Module):
         self.args = args
 
     # factored out for torch.compile
-    @torch.compile
+    # @torch.compile
     def transformer_block(self, x, start_pos, kv_freqs, q_freqs, mask):
         for layer in self.layers:
             x = layer(x, start_pos, kv_freqs, q_freqs, mask)
@@ -351,61 +362,6 @@ def set_random_seed(seed: int):
     tensor_parallel.model_parallel_cuda_manual_seed(seed)
 
 
-params = {
-    65: ModelArgs(dim=8192, n_heads=64, n_layers=80, vocab_size=50432, norm_eps=1e-5),
-    30: ModelArgs(
-        dim=6656, n_heads=52, n_layers=60, vocab_size=50432, norm_eps=1e-6, max_seq_len=4096
-    ),
-    # 30: ModelArgs(dim=8192, n_heads=64, n_layers=36, vocab_size=50432, norm_eps=1e-6, max_seq_len=4096),
-    15: ModelArgs(dim=8192, n_heads=64, n_layers=20, vocab_size=50432, norm_eps=1e-6),
-    7: ModelArgs(dim=4096, n_heads=32, n_layers=32, vocab_size=50432, norm_eps=1e-6),
-}
-
-
-def convert_llama_state_dict(
-    args: ModelArgs,
-    state_dict,
-    tp_rank: int,
-    tp_world: int,
-    pp_rank: int,
-    pp_world: int,
-):
-    state_dict = state_dict.copy()
-    state_dict.pop("rope.freqs")
-    # in original code, token embeddings are sharded across latent dim, but apex shards them along vocab dim
-    if pp_rank == 0:
-        tok_embeds = state_dict["tok_embeddings.weight"].cuda()
-        full_embeds = tensor_parallel.gather_from_tensor_model_parallel_region(tok_embeds)
-        local_vocab_size = args.vocab_size // tp_world
-        tok_embeds = full_embeds[tp_rank * local_vocab_size : (tp_rank + 1) * local_vocab_size]
-        state_dict["tok_embeddings.weight"] = tok_embeds.cpu()
-    else:
-        state_dict.pop("tok_embeddings.weight")
-
-    if pp_rank != (pp_world - 1):
-        state_dict.pop("norm.weight")
-        state_dict.pop("output.weight")
-
-    def offset_layer_idx(name):
-        stage_layers = args.n_layers // pp_world
-        if name.startswith("layers."):
-            layer_idx = int(name.split(".")[1])
-            if pp_rank * stage_layers <= layer_idx < (pp_rank + 1) * stage_layers:
-                new_layer_idx = layer_idx - pp_rank * stage_layers
-                return name.replace(f"layers.{layer_idx}", f"layers.{new_layer_idx}")
-            else:
-                return None
-        else:
-            return name
-
-    state_dict = {
-        offset_layer_idx(k): v for k, v in state_dict.items() if offset_layer_idx(k) is not None
-    }
-
-    state_dict = {("module.wrapped." + k): v for k, v in state_dict.items()}
-    return state_dict
-
-
 from sentencepiece import SentencePieceProcessor
 from logging import getLogger
 from typing import List
@@ -415,33 +371,22 @@ import os
 logger = getLogger()
 
 
-class Tokenizer:
-    def __init__(self, model_path: str):
-        # reload tokenizer
-        assert os.path.isfile(model_path), model_path
-        self.sp_model = SentencePieceProcessor(model_file=model_path)
-        logger.info(f"Reloaded SentencePiece model from {model_path}")
+def reshard_state_dict(state_dict, tp_rank, tp_world, pp_rank, pp_world):
+    def reshard_longest(weight):
 
-        # BOS / EOS token IDs
-        self.n_words: int = self.sp_model.vocab_size()
-        self.bos_id: int = self.sp_model.bos_id()
-        self.eos_id: int = self.sp_model.eos_id()
-        self.pad_id: int = self.sp_model.pad_id()
-        logger.info(f"#words: {self.n_words} - BOS ID: {self.bos_id} - EOS ID: {self.eos_id}")
-        assert self.sp_model.vocab_size() == self.sp_model.get_piece_size()
+        longest_dim = max(weight.shape)
+        longest_dim_idx = weight.shape.index(longest_dim)
+        chunk = longest_dim // tp_world
+        slicer = [
+            slice(None)
+            if i != longest_dim_idx
+            else slice(chunk * tp_rank, chunk * (tp_rank + 1))
+            for i in range(len(weight.shape))
+        ]
+        return weight[slicer]
 
-    def encode(self, s: str, bos: bool, eos: bool) -> List[int]:
-        assert type(s) is str
-        t = self.sp_model.encode(s)
-        if bos:
-            t = [self.bos_id] + t
-        if eos:
-            t = t + [self.eos_id]
-        return t
 
-    def decode(self, t: List[int]) -> str:
-        return self.sp_model.decode(t)
-
+def in
 
 def main():
     rank = int(os.environ["SLURM_PROCID"])
@@ -470,9 +415,11 @@ def main():
         tensor_model_parallel_size * pipeline_model_parallel_size
     )
 
-    # tok = Tokenizer("/mnt/hdd/llama2/tokenizer.model")
-    # llama_args = ModelArgs(**dict(params[65].__dict__, vocab_size=tok.n_words))
-    llama_args = ModelArgs(**dict(params[30].__dict__, vocab_size=32000))
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+
+    tokenizer = AutoTokenizer.from_pretrained("EleutherAI/pythia-6.9b-deduped")
+    hf_model = AutoModelForCausalLM.from_pretrained("EleutherAI/pythia-6.9b-deduped")
+    hf_state_dict = hf_model.state_dict()
 
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
     pp_rank = parallel_state.get_pipeline_model_parallel_rank()
@@ -573,63 +520,6 @@ def main():
     if rank == 0:
         print(f"start {io_shape}", flush=True)
 
-    # prompt = [tok.encode("Hello world, my name is", bos=True, eos=False)]
-    # prompt_lengths = [len(p) for p in prompt]
-    # prompt = [p + [tok.eos_id] * (len(p) - llama_args.max_seq_len) for p in prompt]
-    # prompt = torch.tensor(prompt).long().cuda()
-
-    # _reconfigure_microbatch_calculator(
-    #     rank=rank,
-    #     rampup_batch_size=None,
-    #     global_batch_size=micro_batch_size,
-    #     micro_batch_size=micro_batch_size,
-    #     data_parallel_size=1,
-    # )
-
-    # with torch.no_grad():
-    #     for i in range(100):
-    #         output = forward_backward_func(
-    #             inference_forward_step_func,
-    #             [prompt],
-    #             models,
-    #             forward_only=True,
-    #             tensor_shape=(prompt.shape[1], 1, llama_args.dim),
-    #             dtype=torch.bfloat16,
-    #         )
-
-    #         if parallel_state.is_pipeline_last_stage():
-    #             logits = output[0]["logits"].float()
-    #             logits = rearrange(logits, "s b n -> b s n")
-    #             logits = tensor_parallel.gather_from_tensor_model_parallel_region(
-    #                 logits
-    #             )
-    #             prompt = torch.cat([prompt, logits[:, -1:].argmax(dim=-1)], dim=1)
-    #             src = parallel_state.get_pipeline_model_parallel_last_rank()
-    #             group = parallel_state.get_embedding_group()
-    #             torch.distributed.broadcast(prompt, src, group)
-    #         elif parallel_state.is_pipeline_first_stage():
-    #             new_prompt = torch.empty(
-    #                 (prompt.shape[0], prompt.shape[1] + 1),
-    #                 dtype=prompt.dtype,
-    #                 device=prompt.device,
-    #             )
-    #             src = parallel_state.get_pipeline_model_parallel_last_rank()
-    #             group = parallel_state.get_embedding_group()
-    #             torch.distributed.broadcast(new_prompt, src, group)
-    #             prompt = new_prompt
-
-    #         if rank == 0:
-    #             text_output = tok.decode(prompt[0].cpu().numpy().tolist())
-    #             print(text_output)
-
-    # return
-    # _reconfigure_microbatch_calculator(
-    #     rank=rank,
-    #     rampup_batch_size=None,
-    #     global_batch_size=global_batch_size,
-    #     micro_batch_size=micro_batch_size,
-    #     data_parallel_size=data_parallel_size,
-    # )
 
     for batch in data_loader:
         optimizer.zero_grad()
@@ -648,15 +538,20 @@ def main():
 
         dt = time.time() - t
         if rank == (world_size - 1):
-            print(f"tflops: {approx_model_flops / (dt * world_size) / 1e12=}", flush=True)
+            print(
+                f"tflops: {approx_model_flops / (dt * world_size) / 1e12=}", flush=True
+            )
             memory_usage_gb = torch.cuda.max_memory_allocated() / 1e9
             print(f"memory usage: {memory_usage_gb=}", flush=True)
             samples_per_sec = global_batch_size / dt
             print(f"throughput: {samples_per_sec=}", flush=True)
             print(f"{len(loss)=}", flush=True)
 
+        # Need to sum across sequence when using sequence parallelism
         rmsnorms = [m for _, m in models[0].named_modules() if isinstance(m, RMSNorm)]
-        rmsnorm_grads = [param.grad for rmsnorm in rmsnorms for param in rmsnorm.parameters()]
+        rmsnorm_grads = [
+            param.grad for rmsnorm in rmsnorms for param in rmsnorm.parameters()
+        ]
         rmsnorm_grads = [grad for grad in rmsnorm_grads if grad is not None]
         if rmsnorm_grads:
             coalesced = torch._utils._flatten_dense_tensors(rmsnorm_grads)
@@ -664,7 +559,8 @@ def main():
                 coalesced, group=parallel_state.get_tensor_model_parallel_group()
             )
             for buf, synced in zip(
-                rmsnorm_grads, torch._utils._unflatten_dense_tensors(coalesced, rmsnorm_grads)
+                rmsnorm_grads,
+                torch._utils._unflatten_dense_tensors(coalesced, rmsnorm_grads),
             ):
                 buf.copy_(synced)
 

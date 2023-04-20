@@ -512,12 +512,12 @@ def sample_random_chunks(data, chunk_size, batch_size):
         chunks = torch.stack([data[i : i + chunk_size] for i in idxes])
         yield chunks
 
-def inference(models, tok, text, llama_args, micro_batch_size, rank, forward_backward_func):
+def inference(models, tok, texts, llama_args, micro_batch_size, rank, forward_backward_func, n=100):
 
-    prompt = [tok.encode(text, bos=False, eos=False)]
+    prompts = [tok.encode(text, bos=False, eos=False) for text in texts]
     prompt_lengths = [len(p) for p in prompt]
-    prompt = [p + [tok.eos_id] * (len(p) - llama_args.max_seq_len) for p in prompt]
-    prompt = torch.tensor(prompt).long().cuda()
+    inputs = [p + [tok.eos_id] * (len(p) - llama_args.max_seq_len) for p in prompts]
+    inputs = torch.tensor(inputs).long().cuda()
 
     _reconfigure_microbatch_calculator(
         rank=rank,
@@ -528,10 +528,10 @@ def inference(models, tok, text, llama_args, micro_batch_size, rank, forward_bac
     )
 
     with torch.no_grad():
-        for i in range(100):
+        for i in range(n):
             output = forward_backward_func(
                 inference_forward_step_func,
-                [prompt],
+                [inputs],
                 models,
                 forward_only=True,
                 tensor_shape=(prompt.shape[1], 1, llama_args.dim),
@@ -544,24 +544,17 @@ def inference(models, tok, text, llama_args, micro_batch_size, rank, forward_bac
                 logits = tensor_parallel.gather_from_tensor_model_parallel_region(
                     logits
                 )
-                prompt = torch.cat([prompt, logits[:, -1:].argmax(dim=-1)], dim=1)
+                for i, l in enumerate(prompt_lengths):
+                    inputs[i, l] = logits[i, l].argmax(dim=-1).item()
                 src = parallel_state.get_pipeline_model_parallel_last_rank()
                 group = parallel_state.get_embedding_group()
-                torch.distributed.broadcast(prompt, src, group)
+                torch.distributed.broadcast(inputs, src, group)
             elif parallel_state.is_pipeline_first_stage():
-                new_prompt = torch.empty(
-                    (prompt.shape[0], prompt.shape[1] + 1),
-                    dtype=prompt.dtype,
-                    device=prompt.device,
-                )
                 src = parallel_state.get_pipeline_model_parallel_last_rank()
                 group = parallel_state.get_embedding_group()
-                torch.distributed.broadcast(new_prompt, src, group)
-                prompt = new_prompt
+                torch.distributed.broadcast(inputs, src, group)
 
-            if rank == 0:
-                text_output = tok.decode(prompt[0].cpu().numpy().tolist())
-                print(text_output)
+            prompt_lengths = [l + 1 for l in prompt_lengths]
 
     _reconfigure_microbatch_calculator(
         rank=rank,
@@ -570,6 +563,8 @@ def inference(models, tok, text, llama_args, micro_batch_size, rank, forward_bac
         micro_batch_size=micro_batch_size,
         data_parallel_size=data_parallel_size,
     )
+
+    return [tok.decode(p.cpu().numpy().tolist()) for p in inputs]
 
 def main():
     rank = int(os.environ["SLURM_PROCID"])
@@ -749,7 +744,7 @@ def main():
             '''inference(
                 models,
                 tok,
-                "Below is an instruction that describes a task,",
+                ["Below is an instruction that describes a task,"],
                 llama_args,
                 micro_batch_size,
                 rank,
