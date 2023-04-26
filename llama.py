@@ -719,229 +719,229 @@ def inference_server(
             [*infer_text(None)]
 
 
-    def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Path):
-        rank = int(os.environ["SLURM_PROCID"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        gpus_per_node = int(os.environ["SLURM_GPUS_ON_NODE"])
-        assert gpus_per_node == torch.cuda.device_count()
-        print(f"hi from {rank}/{world_size} on {gethostname()}", flush=True)
+def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Path):
+    rank = int(os.environ["SLURM_PROCID"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    gpus_per_node = int(os.environ["SLURM_GPUS_ON_NODE"])
+    assert gpus_per_node == torch.cuda.device_count()
+    print(f"hi from {rank}/{world_size} on {gethostname()}", flush=True)
 
-        torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size)
+    torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size)
 
-        local_rank = rank - gpus_per_node * (rank // gpus_per_node)
-        torch.cuda.set_device(local_rank)
+    local_rank = rank - gpus_per_node * (rank // gpus_per_node)
+    torch.cuda.set_device(local_rank)
 
-        tensor_model_parallel_size = tp_world
-        pipeline_model_parallel_size = pp_world
-        virtual_pipeline_model_parallel_size = None
+    tensor_model_parallel_size = tp_world
+    pipeline_model_parallel_size = pp_world
+    virtual_pipeline_model_parallel_size = None
 
-        parallel_state.initialize_model_parallel(
-            tensor_model_parallel_size,
-            pipeline_model_parallel_size,
-            virtual_pipeline_model_parallel_size,
+    parallel_state.initialize_model_parallel(
+        tensor_model_parallel_size,
+        pipeline_model_parallel_size,
+        virtual_pipeline_model_parallel_size,
+    )
+
+    world_size = torch.distributed.get_world_size()
+    data_parallel_size: int = world_size // (
+        tensor_model_parallel_size * pipeline_model_parallel_size
+    )
+
+    tok = SentencePieceProcessor(str(tokenizer))
+    
+    with open(llama / "params.json") as f:
+        params = json.load(f)
+    
+    # round vocab size to nearest multiple of 256
+    vocab_size = 256 * ((tok.vocab_size() + 255) // 256)
+    llama_args = ModelArgs(**dict(params, vocab_size=vocab_size))
+
+    if rank == (world_size - 1):
+        wandb.init(
+            project="tinypar",
+            entity="uwu1",
+            name="llama",
+            config=llama_args.__dict__,
         )
 
-        world_size = torch.distributed.get_world_size()
-        data_parallel_size: int = world_size // (
-            tensor_model_parallel_size * pipeline_model_parallel_size
-        )
 
-        tok = SentencePieceProcessor(str(tokenizer))
-        
-        with open(llama / "params.json") as f:
-            params = json.load(f)
-        
-        # round vocab size to nearest multiple of 256
-        vocab_size = 256 * ((tok.vocab_size() + 255) // 256)
-        llama_args = ModelArgs(**dict(params, vocab_size=vocab_size))
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
 
-        if rank == (world_size - 1):
-            wandb.init(
-                project="tinypar",
-                entity="uwu1",
-                name="llama",
-                config=llama_args.__dict__,
-            )
+    state_dict = torch.load(llama / f"consolidated.{tp_rank:02d}.pth")
+    state_dict = convert_llama_state_dict(
+        llama_args,
+        state_dict,
+        tp_rank,
+        tensor_model_parallel_size,
+        pp_rank,
+        pipeline_model_parallel_size,
+        add_new_tokens=vocab_size - 32000
+    )
 
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
 
-        tp_rank = parallel_state.get_tensor_model_parallel_rank()
-        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    global_batch_size = 512
+    micro_batch_size = 2
 
-        state_dict = torch.load(llama / f"consolidated.{tp_rank:02d}.pth")
-        state_dict = convert_llama_state_dict(
-            llama_args,
-            state_dict,
-            tp_rank,
-            tensor_model_parallel_size,
-            pp_rank,
-            pipeline_model_parallel_size,
-            add_new_tokens=vocab_size - 32000
-        )
+    setup_microbatch_calculator(
+        rank=rank,
+        rampup_batch_size=None,
+        global_batch_size=global_batch_size,
+        micro_batch_size=micro_batch_size,
+        data_parallel_size=data_parallel_size,
+    )
 
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
+    set_random_seed(2023)
 
-        global_batch_size = 512
-        micro_batch_size = 2
+    forward_backward_func = get_forward_backward_func(
+        virtual_pipeline_model_parallel_size, pipeline_model_parallel_size
+    )
+    print(f"{forward_backward_func=}")
 
-        setup_microbatch_calculator(
-            rank=rank,
-            rampup_batch_size=None,
-            global_batch_size=global_batch_size,
-            micro_batch_size=micro_batch_size,
-            data_parallel_size=data_parallel_size,
-        )
+    model_kwargs = dict(llama_args=llama_args)
+    wrap_with_ddp = True
+    
+    print(model_kwargs, flush=True)
+    models = build_model(
+        model_provider_func,
+        wrap_with_ddp,
+        virtual_pipeline_model_parallel_size,
+        **model_kwargs,
+    )
 
-        set_random_seed(2023)
-
-        forward_backward_func = get_forward_backward_func(
-            virtual_pipeline_model_parallel_size, pipeline_model_parallel_size
-        )
-        print(f"{forward_backward_func=}")
-
-        model_kwargs = dict(llama_args=llama_args)
-        wrap_with_ddp = True
-        
-        print(model_kwargs, flush=True)
-        models = build_model(
-            model_provider_func,
-            wrap_with_ddp,
-            virtual_pipeline_model_parallel_size,
-            **model_kwargs,
-        )
-
-        models[0].load_state_dict(state_dict)
-        del state_dict
-        print("loaded state dict", flush=True)
+    models[0].load_state_dict(state_dict)
+    del state_dict
+    print("loaded state dict", flush=True)
 
 
-        
-        local_rank = torch.cuda.current_device()
+    
+    local_rank = torch.cuda.current_device()
 
-        # optimizer = torch.optim.AdamW(models[0].parameters(), lr=1e-6)
+    # optimizer = torch.optim.AdamW(models[0].parameters(), lr=1e-6)
 
-        optimizer = DistributedFusedAdam(
-            models[0].parameters(),
-            lr=1e-6, # * (global_batch_size / 128),
-            weight_decay=0.0,
-            process_group=parallel_state.get_data_parallel_group(),
-            dtype=torch.bfloat16,
-            # distributed_process_group=torch.distributed.new_group(ranks=[torch.distributed.get_rank()]),
-            # redundant_process_group=parallel_state.get_data_parallel_group(),
-            store_params=False,
-        )
+    optimizer = DistributedFusedAdam(
+        models[0].parameters(),
+        lr=1e-6, # * (global_batch_size / 128),
+        weight_decay=0.0,
+        process_group=parallel_state.get_data_parallel_group(),
+        dtype=torch.bfloat16,
+        # distributed_process_group=torch.distributed.new_group(ranks=[torch.distributed.get_rank()]),
+        # redundant_process_group=parallel_state.get_data_parallel_group(),
+        store_params=False,
+    )
 
-        dp_rank = parallel_state.get_data_parallel_rank()
-        tp_group = parallel_state.get_tensor_model_parallel_group()
+    dp_rank = parallel_state.get_data_parallel_rank()
+    tp_group = parallel_state.get_tensor_model_parallel_group()
 
-        total_params_for_rank = sum(p.numel() for p in models[0].parameters())
-        total_params_world = torch.tensor(total_params_for_rank).cuda()
+    total_params_for_rank = sum(p.numel() for p in models[0].parameters())
+    total_params_world = torch.tensor(total_params_for_rank).cuda()
 
-        torch.distributed.all_reduce(total_params_world, op=torch.distributed.ReduceOp.SUM)
-        total_params = total_params_world.item() / data_parallel_size
-        if rank == 0:
-            print(f"total params: {total_params}", flush=True)
-        
-        io_shape = (llama_args.max_seq_len, micro_batch_size, llama_args.dim)
-        approx_model_flops = 6 * global_batch_size * llama_args.max_seq_len * total_params
+    torch.distributed.all_reduce(total_params_world, op=torch.distributed.ReduceOp.SUM)
+    total_params = total_params_world.item() / data_parallel_size
+    if rank == 0:
+        print(f"total params: {total_params}", flush=True)
+    
+    io_shape = (llama_args.max_seq_len, micro_batch_size, llama_args.dim)
+    approx_model_flops = 6 * global_batch_size * llama_args.max_seq_len * total_params
 
-        if rank == 0:
-            print(f"start {io_shape}", flush=True)
+    if rank == 0:
+        print(f"start {io_shape}", flush=True)
 
 
-        test_prompt = ["Hello, my name is"] * data_parallel_size
+    test_prompt = ["Hello, my name is"] * data_parallel_size
 
+    t = time.time()
+    #inferred = inference(
+    #     models, tok, test_prompt, llama_args, micro_batch_size, rank, forward_backward_func, 10, global_batch_size, data_parallel_size)
+    
+    dt = time.time() - t
+    
+    # print(f"{rank=} {inferred=} {(dt / 10.0)=:.2f}", flush=True)
+    # tokens_per_sec = 128 / dt
+    # print(f"{tokens_per_sec=:.2f}", flush=True)
+
+    data = packed_dataset(tok, "dmayhem93/ChatCombined")
+    
+    rank_batch = global_batch_size // data_parallel_size
+    total_samples = 1 + (len(data) // llama_args.max_seq_len)
+    print(f"{total_samples=}")
+    total_steps = total_samples // global_batch_size
+    step = 0
+    for batch in sample_random_chunks(data, llama_args.max_seq_len + 1, rank_batch):
+        optimizer.zero_grad()
+        batch = batch.to(local_rank)
+        inputs, labels = batch[:, :-1], batch[:, 1:]
         t = time.time()
-        #inferred = inference(
-        #     models, tok, test_prompt, llama_args, micro_batch_size, rank, forward_backward_func, 10, global_batch_size, data_parallel_size)
-        
+        loss = forward_backward_func(
+            train_forward_step_func,
+            [inputs, labels],
+            models,
+            forward_only=False,
+            tensor_shape=io_shape,
+            dtype=torch.bfloat16,
+            async_comm=True,
+            sync_batch_comm=False,
+            sequence_parallel_enabled=True,
+        )
+
         dt = time.time() - t
-        
-        # print(f"{rank=} {inferred=} {(dt / 10.0)=:.2f}", flush=True)
-        # tokens_per_sec = 128 / dt
-        # print(f"{tokens_per_sec=:.2f}", flush=True)
+        if rank == (world_size - 1):
+            print(f"step {step}/{total_steps}", flush=True)
+            print(f"tflops: {approx_model_flops / (dt * world_size) / 1e12=}", flush=True)
+            memory_usage_gb = torch.cuda.max_memory_allocated() / 1e9
+            print(f"memory usage: {memory_usage_gb=}", flush=True)
+            samples_per_sec = global_batch_size / dt
+            print(f"throughput: {samples_per_sec=}", flush=True)
+            print(f"{len(loss)=}", flush=True)
+            loss = [d["nice_loss"] for d in loss]
+            mean_loss = torch.mean(torch.stack(loss).detach())
+            print(f"{mean_loss=}", flush=True)
+            wandb.log(dict(
+                loss=mean_loss.item(),
+                throughput=samples_per_sec,
+            memory_usage=memory_usage_gb,
+            tflops=approx_model_flops / (dt * world_size) / 1e12,
+        ))
 
-        data = packed_dataset(tok, "dmayhem93/ChatCombined")
-        
-        rank_batch = global_batch_size // data_parallel_size
-        total_samples = 1 + (len(data) // llama_args.max_seq_len)
-        print(f"{total_samples=}")
-        total_steps = total_samples // global_batch_size
-        step = 0
-        for batch in sample_random_chunks(data, llama_args.max_seq_len + 1, rank_batch):
-            optimizer.zero_grad()
-            batch = batch.to(local_rank)
-            inputs, labels = batch[:, :-1], batch[:, 1:]
-            t = time.time()
-            loss = forward_backward_func(
-                train_forward_step_func,
-                [inputs, labels],
-                models,
-                forward_only=False,
-                tensor_shape=io_shape,
-                dtype=torch.bfloat16,
-                async_comm=True,
-                sync_batch_comm=False,
-                sequence_parallel_enabled=True,
+        # All-reduce RMSNorm grads over sequence dimension
+        rmsnorms = [m for _, m in models[0].named_modules() if isinstance(m, RMSNorm)]
+        rmsnorm_grads = [param.grad for rmsnorm in rmsnorms for param in rmsnorm.parameters()]
+        rmsnorm_grads = [grad for grad in rmsnorm_grads if grad is not None]
+        if rmsnorm_grads:
+            coalesced = torch._utils._flatten_dense_tensors(rmsnorm_grads)
+            torch.distributed.all_reduce(
+                coalesced, group=parallel_state.get_tensor_model_parallel_group()
             )
+            for buf, synced in zip(
+                rmsnorm_grads, torch._utils._unflatten_dense_tensors(coalesced, rmsnorm_grads)
+            ):
+                buf.copy_(synced)
 
-            dt = time.time() - t
-            if rank == (world_size - 1):
-                print(f"step {step}/{total_steps}", flush=True)
-                print(f"tflops: {approx_model_flops / (dt * world_size) / 1e12=}", flush=True)
-                memory_usage_gb = torch.cuda.max_memory_allocated() / 1e9
-                print(f"memory usage: {memory_usage_gb=}", flush=True)
-                samples_per_sec = global_batch_size / dt
-                print(f"throughput: {samples_per_sec=}", flush=True)
-                print(f"{len(loss)=}", flush=True)
-                loss = [d["nice_loss"] for d in loss]
-                mean_loss = torch.mean(torch.stack(loss).detach())
-                print(f"{mean_loss=}", flush=True)
-                wandb.log(dict(
-                    loss=mean_loss.item(),
-                    throughput=samples_per_sec,
-                memory_usage=memory_usage_gb,
-                tflops=approx_model_flops / (dt * world_size) / 1e12,
-            ))
+        optimizer.step()
 
-            # All-reduce RMSNorm grads over sequence dimension
-            rmsnorms = [m for _, m in models[0].named_modules() if isinstance(m, RMSNorm)]
-            rmsnorm_grads = [param.grad for rmsnorm in rmsnorms for param in rmsnorm.parameters()]
-            rmsnorm_grads = [grad for grad in rmsnorm_grads if grad is not None]
-            if rmsnorm_grads:
-                coalesced = torch._utils._flatten_dense_tensors(rmsnorm_grads)
-                torch.distributed.all_reduce(
-                    coalesced, group=parallel_state.get_tensor_model_parallel_group()
+        if step >= total_steps:
+            break
+
+        if step > 0 and step % 100 == 0:
+            # print(f"{step=}", flush=True)
+            test_prompts = ["<|USER|>"] * data_parallel_size
+            inferred = inference(
+                models, tok, test_prompts, llama_args, micro_batch_size, rank, forward_backward_func, 32, global_batch_size, data_parallel_size)
+            print(f"{inferred=}", flush=True)
+
+        if (step % 1000) == 0 or (step == total_steps):
+            torch.distributed.barrier()
+            if rank < (tensor_model_parallel_size * pipeline_model_parallel_size):
+                print("saving", flush=True)
+                os.makedirs(save_to, exist_ok=True)
+                torch.save(
+                    models[0].state_dict(),
+                    save_to / f"ckpt-tp-consolidated.{tp_rank:02d}.pth",
                 )
-                for buf, synced in zip(
-                    rmsnorm_grads, torch._utils._unflatten_dense_tensors(coalesced, rmsnorm_grads)
-                ):
-                    buf.copy_(synced)
-
-            optimizer.step()
-
-            if step >= total_steps:
-                break
-
-            if step > 0 and step % 100 == 0:
-                # print(f"{step=}", flush=True)
-                test_prompts = ["<|USER|>"] * data_parallel_size
-                inferred = inference(
-                    models, tok, test_prompts, llama_args, micro_batch_size, rank, forward_backward_func, 32, global_batch_size, data_parallel_size)
-                print(f"{inferred=}", flush=True)
-
-            if (step % 1000) == 0 or (step == total_steps):
-                torch.distributed.barrier()
-                if rank < (tensor_model_parallel_size * pipeline_model_parallel_size):
-                    print("saving", flush=True)
-                    os.makedirs(save_to, exist_ok=True)
-                    torch.save(
-                        models[0].state_dict(),
-                        save_to / f"ckpt-tp-consolidated.{tp_rank:02d}.pth",
-                    )
-                    if rank == 0:
-                        print("done", flush=True)
-                torch.distributed.barrier()
+                if rank == 0:
+                    print("done", flush=True)
+            torch.distributed.barrier()
 
     print("done", flush=True)
     torch.distributed.barrier()
