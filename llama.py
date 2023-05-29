@@ -484,7 +484,7 @@ from sentencepiece import SentencePieceProcessor
 from logging import getLogger
 from typing import List
 import os
-
+import numpy as np
 
 logger = getLogger()
 
@@ -493,17 +493,15 @@ logger = getLogger()
 def packed_dataset(tokenier, dataset: str):
     cache = Path(f"{dataset}.memap")
     if cache.exists():
-        import numpy
-        array = numpy.memmap(f"{dataset}.memap", dtype="int32", mode="r")
-        return torch.tensor(array)
+        return np.memmap(f"{dataset}.memap", dtype="int32", mode="r")
 
     ds = load_dataset(dataset, split="train")
     ds = ds.map(lambda x: {"text": tokenier.encode(x["text"], add_bos=True, add_eos=True)})
-    flattened = torch.tensor([x for y in ds["text"] for x in y])
+    flattened = np.array([x for y in ds["text"] for x in y])
 
     cache.parent.mkdir(parents=True, exist_ok=True)
     with open(cache, "wb") as f:
-        f.write(flattened.int().numpy().tobytes())
+        f.write(flattened.tobytes())
     return flattened
 
 def sample_random_chunks(data, chunk_size, batch_size):
@@ -511,7 +509,7 @@ def sample_random_chunks(data, chunk_size, batch_size):
     chunk_size = min(data_len, chunk_size)
     while True:
         idxes = torch.randint(0, data_len - chunk_size, (batch_size,))
-        chunks = torch.stack([data[i : i + chunk_size] for i in idxes])
+        chunks = torch.stack([torch.from_numpy(data[i : i + chunk_size].copy()) for i in idxes])
         yield chunks
 
 def inference(models, tok, texts: list[str], llama_args: ModelArgs, micro_batch_size: int, rank: int, forward_backward_func, n: int, global_batch_size: int, data_parallel_size: int, stream=False):
@@ -767,22 +765,26 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
     pp_rank = parallel_state.get_pipeline_model_parallel_rank()
 
-    state_dict = torch.load(llama / f"consolidated.{tp_rank:02d}.pth")
-    state_dict = convert_llama_state_dict(
-        llama_args,
-        state_dict,
-        tp_rank,
-        tensor_model_parallel_size,
-        pp_rank,
-        pipeline_model_parallel_size,
-        add_new_tokens=vocab_size - 32000
-    )
+    try:
+        state_dict = torch.load(llama / f"consolidated.{tp_rank:02d}.pth")
+        state_dict = convert_llama_state_dict(
+            llama_args,
+            state_dict,
+            tp_rank,
+            tensor_model_parallel_size,
+            pp_rank,
+            pipeline_model_parallel_size,
+            add_new_tokens=vocab_size - 32000
+        )
+    except FileNotFoundError:
+        print(f"no checkpoint found")
+        state_dict = None
 
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
     global_batch_size = 512
-    micro_batch_size = 2
+    micro_batch_size = 4
 
     setup_microbatch_calculator(
         rank=rank,
@@ -809,10 +811,12 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
         virtual_pipeline_model_parallel_size,
         **model_kwargs,
     )
+    print("built model", flush=True)
 
-    models[0].load_state_dict(state_dict)
-    del state_dict
-    print("loaded state dict", flush=True)
+    if state_dict is not None:
+        models[0].load_state_dict(state_dict)
+        del state_dict
+        print("loaded state dict", flush=True)
 
 
     
@@ -831,6 +835,7 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
         store_params=False,
     )
 
+    print("constructed opt", flush=True)
     dp_rank = parallel_state.get_data_parallel_rank()
     tp_group = parallel_state.get_tensor_model_parallel_group()
 
@@ -861,13 +866,17 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
     # tokens_per_sec = 128 / dt
     # print(f"{tokens_per_sec=:.2f}", flush=True)
 
-    data = packed_dataset(tok, "dmayhem93/ChatCombined")
+    data = packed_dataset(tok, "JeanKaddour/minipile")
     
     rank_batch = global_batch_size // data_parallel_size
     total_samples = 1 + (len(data) // llama_args.max_seq_len)
-    print(f"{total_samples=}")
+    print(f"{total_samples=}", flush=True)
     total_steps = total_samples // global_batch_size
     step = 0
+    num_tokens = 0
+    if rank == (world_size - 1):
+        wandb.define_metric("num_tokens")
+        wandb.define_metric("loss", step_metric="num_tokens")
     for batch in sample_random_chunks(data, llama_args.max_seq_len + 1, rank_batch):
         optimizer.zero_grad()
         batch = batch.to(local_rank)
@@ -884,6 +893,7 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
             sync_batch_comm=False,
             sequence_parallel_enabled=True,
         )
+        num_tokens += inputs.numel()
 
         dt = time.time() - t
         if rank == (world_size - 1):
@@ -900,9 +910,11 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
             wandb.log(dict(
                 loss=mean_loss.item(),
                 throughput=samples_per_sec,
-            memory_usage=memory_usage_gb,
-            tflops=approx_model_flops / (dt * world_size) / 1e12,
-        ))
+                memory_usage=memory_usage_gb,
+                tflops=approx_model_flops / (dt * world_size) / 1e12,
+                num_tokens=num_tokens,
+                tokens_per_sec=inputs.numel() / dt,
+            ))
 
         # All-reduce RMSNorm grads over sequence dimension
         rmsnorms = [m for _, m in models[0].named_modules() if isinstance(m, RMSNorm)]
@@ -925,7 +937,7 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
 
         if step > 0 and step % 100 == 0:
             # print(f"{step=}", flush=True)
-            test_prompts = ["<|USER|>"] * data_parallel_size
+            test_prompts = ["My name is"] * data_parallel_size
             inferred = inference(
                 models, tok, test_prompts, llama_args, micro_batch_size, rank, forward_backward_func, 32, global_batch_size, data_parallel_size)
             print(f"{inferred=}", flush=True)
@@ -942,6 +954,8 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
                 if rank == 0:
                     print("done", flush=True)
             torch.distributed.barrier()
+
+        step += 1
 
     print("done", flush=True)
     torch.distributed.barrier()
