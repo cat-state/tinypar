@@ -38,7 +38,9 @@ def identity(x):
     return x
 
 # torch.compile = identity
-# torch._dynamo.config.cache_size_limit = 1000
+# torch._dynamo.config.cache_size_limit = 100
+
+SP = True
 
 @dataclass
 class ModelArgs:
@@ -60,12 +62,12 @@ class RMSNorm(torch.nn.Module):
         self.weight = nn.Parameter(torch.ones(dim, dtype=dtype))
 
     @torch.compile
-    def _norm(self, x, eps, weight):
+    def _norm(x, eps, weight):
         out = x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps).type_as(x)
         return out * weight
 
     def forward(self, x):
-        return self._norm(x, self.eps, self.weight)
+        return RMSNorm._norm(x, self.eps, self.weight)
 
 
 def precompute_freqs(dim: int, end: int, theta: float = 10000.0):
@@ -130,8 +132,8 @@ class Attention(nn.Module):
             gather_output=False,
             init_method=lambda x: x,
             params_dtype=dtype,
-            sequence_parallel_enabled=True,
-            no_async_tensor_model_parallel_allreduce=True,
+            sequence_parallel_enabled=SP,
+            no_async_tensor_model_parallel_allreduce=SP,
         )
         self.wk = tensor_parallel.ColumnParallelLinear(
             args.dim,
@@ -140,8 +142,8 @@ class Attention(nn.Module):
             gather_output=False,
             init_method=lambda x: x,
             params_dtype=dtype,
-            sequence_parallel_enabled=True,
-            no_async_tensor_model_parallel_allreduce=True,
+            sequence_parallel_enabled=SP,
+            no_async_tensor_model_parallel_allreduce=SP,
         )
         self.wv = tensor_parallel.ColumnParallelLinear(
             args.dim,
@@ -150,8 +152,8 @@ class Attention(nn.Module):
             gather_output=False,
             init_method=lambda x: x,
             params_dtype=dtype,
-            sequence_parallel_enabled=True,
-            no_async_tensor_model_parallel_allreduce=True,
+            sequence_parallel_enabled=SP,
+            no_async_tensor_model_parallel_allreduce=SP,
         )
         self.wo = tensor_parallel.RowParallelLinear(
             args.n_heads * self.head_dim,
@@ -160,7 +162,7 @@ class Attention(nn.Module):
             input_is_parallel=True,
             init_method=lambda x: x,
             params_dtype=dtype,
-            sequence_parallel_enabled=True,
+            sequence_parallel_enabled=SP,
         )
 
     def forward(
@@ -195,7 +197,7 @@ class Attention(nn.Module):
             return add_bias(self.wo(output))
 
 
-# @torch.compile
+@torch.compile
 def gated_silu(x, gate):
     return F.silu(x) * gate
 
@@ -219,8 +221,8 @@ class FeedForward(nn.Module):
             gather_output=False,
             init_method=lambda x: x,
             params_dtype=dtype,
-            sequence_parallel_enabled=True,
-            no_async_tensor_model_parallel_allreduce=True,
+            sequence_parallel_enabled=SP,
+            no_async_tensor_model_parallel_allreduce=SP,
         )
         self.w2 = tensor_parallel.RowParallelLinear(
             hidden_dim,
@@ -229,7 +231,7 @@ class FeedForward(nn.Module):
             input_is_parallel=True,
             init_method=lambda x: x,
             params_dtype=dtype,
-            sequence_parallel_enabled=True,
+            sequence_parallel_enabled=SP,
         )
         self.w3 = tensor_parallel.ColumnParallelLinear(
                 dim,
@@ -238,8 +240,8 @@ class FeedForward(nn.Module):
                 gather_output=False,
                 init_method=lambda x: x,
                 params_dtype=dtype,
-                sequence_parallel_enabled=True,
-                no_async_tensor_model_parallel_allreduce=True,
+                sequence_parallel_enabled=SP,
+                no_async_tensor_model_parallel_allreduce=SP,
             )
 
     def forward(self, x):
@@ -305,15 +307,15 @@ class SplitLlama(nn.Module):
                 bias=False,
                 params_dtype=dtype,
                 gather_output=False,
-                sequence_parallel_enabled=True,
-                no_async_tensor_model_parallel_allreduce=True,
+                sequence_parallel_enabled=SP,
+                no_async_tensor_model_parallel_allreduce=SP,
             )
             self.norm = RMSNorm(args.dim, eps=args.norm_eps)
 
         self.args = args
 
     # factored out for torch.compile
-    # @torch.compile
+    @torch.compile
     def transformer_block(self, x, start_pos, kv_freqs, q_freqs, mask):
         for layer in self.layers:
             x = layer(x, start_pos, kv_freqs, q_freqs, mask)
@@ -323,12 +325,13 @@ class SplitLlama(nn.Module):
         if self.pp_rank == 0:
             x = self.tok_embeddings(tokens_or_hidden_state)
             x = rearrange(x, "b s d -> s b d")
-            x = tensor_parallel.mappings.scatter_to_sequence_parallel_region(x)
+            if SP:
+                x = tensor_parallel.mappings.scatter_to_sequence_parallel_region(x)
         else:
             x = tokens_or_hidden_state
 
         seq_len, batch_size, _ = x.shape
-        total_seq_len = seq_len * self.tp_world
+        total_seq_len = seq_len * self.tp_world if SP else seq_len
 
         mask = torch.full((1, 1, seq_len, seq_len), float("-inf"), device=x.device)
         mask = torch.triu(mask, diagonal=start_pos + 1).type_as(x)
@@ -408,17 +411,6 @@ def set_random_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     tensor_parallel.model_parallel_cuda_manual_seed(seed)
-
-
-params = {
-    65: ModelArgs(dim=8192, n_heads=64, n_layers=80, vocab_size=50432, norm_eps=1e-5),
-    30: ModelArgs(
-        dim=6656, n_heads=52, n_layers=60, vocab_size=50432, norm_eps=1e-6, max_seq_len=4096
-    ),
-    # 30: ModelArgs(dim=8192, n_heads=64, n_layers=36, vocab_size=50432, norm_eps=1e-6, max_seq_len=4096),
-    15: ModelArgs(dim=8192, n_heads=64, n_layers=20, vocab_size=50432, norm_eps=1e-6),
-    7: ModelArgs(dim=4096, n_heads=32, n_layers=32, vocab_size=50432, norm_eps=1e-6),
-}
 
 
 def convert_llama_state_dict(
@@ -504,11 +496,14 @@ def packed_dataset(tokenier, dataset: str):
         f.write(flattened.tobytes())
     return flattened
 
-def sample_random_chunks(data, chunk_size, batch_size):
+def sample_random_chunks(data, chunk_size, batch_size, seed):
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+
     data_len = len(data)
     chunk_size = min(data_len, chunk_size)
     while True:
-        idxes = torch.randint(0, data_len - chunk_size, (batch_size,))
+        idxes = torch.randint(0, data_len - chunk_size, (batch_size,), generator=generator)
         chunks = torch.stack([torch.from_numpy(data[i : i + chunk_size].copy()) for i in idxes])
         yield chunks
 
@@ -781,10 +776,9 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
         state_dict = None
 
     torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
 
-    global_batch_size = 512
-    micro_batch_size = 4
+    global_batch_size = 256 
+    micro_batch_size = 2
 
     setup_microbatch_calculator(
         rank=rank,
@@ -817,23 +811,22 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
         models[0].load_state_dict(state_dict)
         del state_dict
         print("loaded state dict", flush=True)
-
-
-    
+ 
     local_rank = torch.cuda.current_device()
 
-    # optimizer = torch.optim.AdamW(models[0].parameters(), lr=1e-6)
-
+    # optimizer = torch.optim.AdamW(models[0].parameters(), lr=1e-4, weight_decay=0.1)
+    
     optimizer = DistributedFusedAdam(
         models[0].parameters(),
-        lr=1e-6, # * (global_batch_size / 128),
-        weight_decay=0.0,
+        lr=1e-4, # * (global_batch_size / 128),
+        weight_decay=0.1,
         process_group=parallel_state.get_data_parallel_group(),
         dtype=torch.bfloat16,
         # distributed_process_group=torch.distributed.new_group(ranks=[torch.distributed.get_rank()]),
         # redundant_process_group=parallel_state.get_data_parallel_group(),
         store_params=False,
     )
+    
 
     print("constructed opt", flush=True)
     dp_rank = parallel_state.get_data_parallel_rank()
@@ -853,18 +846,9 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
     if rank == 0:
         print(f"start {io_shape}", flush=True)
 
-
-    test_prompt = ["Hello, my name is"] * data_parallel_size
-
     t = time.time()
-    #inferred = inference(
-    #     models, tok, test_prompt, llama_args, micro_batch_size, rank, forward_backward_func, 10, global_batch_size, data_parallel_size)
     
     dt = time.time() - t
-    
-    # print(f"{rank=} {inferred=} {(dt / 10.0)=:.2f}", flush=True)
-    # tokens_per_sec = 128 / dt
-    # print(f"{tokens_per_sec=:.2f}", flush=True)
 
     data = packed_dataset(tok, "JeanKaddour/minipile")
     
@@ -877,7 +861,7 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
     if rank == (world_size - 1):
         wandb.define_metric("num_tokens")
         wandb.define_metric("loss", step_metric="num_tokens")
-    for batch in sample_random_chunks(data, llama_args.max_seq_len + 1, rank_batch):
+    for batch in sample_random_chunks(data, llama_args.max_seq_len + 1, rank_batch, seed=dp_rank):
         optimizer.zero_grad()
         batch = batch.to(local_rank)
         inputs, labels = batch[:, :-1], batch[:, 1:]
@@ -889,9 +873,9 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
             forward_only=False,
             tensor_shape=io_shape,
             dtype=torch.bfloat16,
-            async_comm=True,
+            async_comm=True, #pp_world == 0,
             sync_batch_comm=False,
-            sequence_parallel_enabled=True,
+            sequence_parallel_enabled=SP,
         )
         num_tokens += inputs.numel()
 
@@ -935,14 +919,14 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
         if step >= total_steps:
             break
 
-        if step > 0 and step % 100 == 0:
+        if False: # step > 0 and step % 100 == 0:
             # print(f"{step=}", flush=True)
             test_prompts = ["My name is"] * data_parallel_size
             inferred = inference(
                 models, tok, test_prompts, llama_args, micro_batch_size, rank, forward_backward_func, 32, global_batch_size, data_parallel_size)
-            print(f"{inferred=}", flush=True)
+            print(f"{[*inferred]=}", flush=True)
 
-        if (step % 1000) == 0 or (step == total_steps):
+        if False: #(step % 1000) == 0 or (step == total_steps):
             torch.distributed.barrier()
             if rank < (tensor_model_parallel_size * pipeline_model_parallel_size):
                 print("saving", flush=True)
@@ -964,7 +948,7 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
         os.makedirs(save_to, exist_ok=True)
         torch.save(
             models[0].state_dict(),
-            save_to / f"tp-consolidated.{tp_rank:02d}.pth",
+            save_to / f"tp-consolidated.{tp_rank:02d}.{pp_rank:02d}.pth",
         
         )
 
