@@ -1,3 +1,4 @@
+from functools import partial
 import os
 import json
 from pathlib import Path
@@ -130,7 +131,6 @@ class Attention(nn.Module):
             args.n_heads * self.head_dim,
             bias=False,
             gather_output=False,
-            init_method=lambda x: x,
             params_dtype=dtype,
             sequence_parallel_enabled=SP,
             no_async_tensor_model_parallel_allreduce=SP,
@@ -140,7 +140,6 @@ class Attention(nn.Module):
             args.n_heads * self.head_dim,
             bias=False,
             gather_output=False,
-            init_method=lambda x: x,
             params_dtype=dtype,
             sequence_parallel_enabled=SP,
             no_async_tensor_model_parallel_allreduce=SP,
@@ -150,7 +149,6 @@ class Attention(nn.Module):
             args.n_heads * self.head_dim,
             bias=False,
             gather_output=False,
-            init_method=lambda x: x,
             params_dtype=dtype,
             sequence_parallel_enabled=SP,
             no_async_tensor_model_parallel_allreduce=SP,
@@ -160,7 +158,6 @@ class Attention(nn.Module):
             args.dim,
             bias=False,
             input_is_parallel=True,
-            init_method=lambda x: x,
             params_dtype=dtype,
             sequence_parallel_enabled=SP,
         )
@@ -219,7 +216,6 @@ class FeedForward(nn.Module):
             hidden_dim,
             bias=False,
             gather_output=False,
-            init_method=lambda x: x,
             params_dtype=dtype,
             sequence_parallel_enabled=SP,
             no_async_tensor_model_parallel_allreduce=SP,
@@ -229,7 +225,6 @@ class FeedForward(nn.Module):
             dim,
             bias=False,
             input_is_parallel=True,
-            init_method=lambda x: x,
             params_dtype=dtype,
             sequence_parallel_enabled=SP,
         )
@@ -238,7 +233,6 @@ class FeedForward(nn.Module):
                 hidden_dim,
                 bias=False,
                 gather_output=False,
-                init_method=lambda x: x,
                 params_dtype=dtype,
                 sequence_parallel_enabled=SP,
                 no_async_tensor_model_parallel_allreduce=SP,
@@ -315,7 +309,7 @@ class SplitLlama(nn.Module):
         self.args = args
 
     # factored out for torch.compile
-    @torch.compile
+    @partial(torch.compile, mode="max-autotune")
     def transformer_block(self, x, start_pos, kv_freqs, q_freqs, mask):
         for layer in self.layers:
             x = layer(x, start_pos, kv_freqs, q_freqs, mask)
@@ -488,10 +482,11 @@ def packed_dataset(tokenier, dataset: str):
         return np.memmap(f"{dataset}.memap", dtype="int32", mode="r")
 
     ds = load_dataset(dataset, split="train")
-    ds = ds.map(lambda x: {"text": tokenier.encode(x["text"], add_bos=True, add_eos=True)})
+    ds = ds.map(lambda x: {"text": tokenier.encode(x["text"], add_bos=True, add_eos=True)}, batched=True)
     flattened = np.array([x for y in ds["text"] for x in y])
 
     cache.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Saving {dataset} to {cache}")
     with open(cache, "wb") as f:
         f.write(flattened.tobytes())
     return flattened
@@ -712,7 +707,7 @@ def inference_server(
             [*infer_text(None)]
 
 
-def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Path):
+def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Path, distributed_adam = True):
     rank = int(os.environ["SLURM_PROCID"])
     world_size = int(os.environ["WORLD_SIZE"])
     gpus_per_node = int(os.environ["SLURM_GPUS_ON_NODE"])
@@ -720,6 +715,11 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
     print(f"hi from {rank}/{world_size} on {gethostname()}", flush=True)
 
     torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size)
+
+    if tp_world == 1:
+        global SP
+        SP = False
+
 
     local_rank = rank - gpus_per_node * (rank // gpus_per_node)
     torch.cuda.set_device(local_rank)
@@ -777,8 +777,8 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
 
     torch.backends.cudnn.benchmark = True
 
-    global_batch_size = 256 
-    micro_batch_size = 2
+    global_batch_size = 64
+    micro_batch_size = 8
 
     setup_microbatch_calculator(
         rank=rank,
@@ -815,17 +815,24 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
     local_rank = torch.cuda.current_device()
 
     # optimizer = torch.optim.AdamW(models[0].parameters(), lr=1e-4, weight_decay=0.1)
-    
-    optimizer = DistributedFusedAdam(
-        models[0].parameters(),
-        lr=1e-4, # * (global_batch_size / 128),
-        weight_decay=0.1,
-        process_group=parallel_state.get_data_parallel_group(),
-        dtype=torch.bfloat16,
-        # distributed_process_group=torch.distributed.new_group(ranks=[torch.distributed.get_rank()]),
-        # redundant_process_group=parallel_state.get_data_parallel_group(),
-        store_params=False,
-    )
+    if distributed_adam:
+        optimizer = DistributedFusedAdam(
+            models[0].parameters(),
+            lr=1e-4, # * (global_batch_size / 128),
+            weight_decay=0.1,
+            process_group=parallel_state.get_data_parallel_group(),
+            dtype=torch.bfloat16,
+            # distributed_process_group=torch.distributed.new_group(ranks=[torch.distributed.get_rank()]),
+            # redundant_process_group=parallel_state.get_data_parallel_group(),
+            store_params=False,
+        )
+    else:
+        optimizer = FusedAdam(
+            models[0].parameters(),
+            lr=1e-4, # * (global_batch_size / 128),
+            weight_decay=0.1,
+            adam_w_mode=True,
+        )
     
 
     print("constructed opt", flush=True)
@@ -838,7 +845,7 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
     torch.distributed.all_reduce(total_params_world, op=torch.distributed.ReduceOp.SUM)
     total_params = total_params_world.item() / data_parallel_size
     if rank == 0:
-        print(f"total params: {total_params}", flush=True)
+        print(f"total params: {total_params/1e9:.2f}B", flush=True)
     
     io_shape = (llama_args.max_seq_len, micro_batch_size, llama_args.dim)
     approx_model_flops = 6 * global_batch_size * llama_args.max_seq_len * total_params
@@ -850,7 +857,7 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
     
     dt = time.time() - t
 
-    data = packed_dataset(tok, "JeanKaddour/minipile")
+    data = packed_dataset(tok, "openwebtext")
     
     rank_batch = global_batch_size // data_parallel_size
     total_samples = 1 + (len(data) // llama_args.max_seq_len)
@@ -877,7 +884,7 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
             sync_batch_comm=False,
             sequence_parallel_enabled=SP,
         )
-        num_tokens += inputs.numel()
+        num_tokens += inputs.numel() * data_parallel_size
 
         dt = time.time() - t
         if rank == (world_size - 1):
@@ -965,8 +972,9 @@ if __name__ == "__main__":
     parser.add_argument("--pp-world", default=1, type=int)
     parser.add_argument("--server", action="store_true", default=False)
     parser.add_argument("--save-to", default="/mnt/hdd/cc-llama2/65B", type=Path)
+    parser.add_argument("--no-distributed-adam", action="store_true", default=False)
     args = parser.parse_args()
     if not args.server:
-        main(llama=args.llama, tokenizer=args.tokenizer, tp_world=args.tp_world, pp_world=args.pp_world, save_to=args.save_to)
+        main(llama=args.llama, tokenizer=args.tokenizer, tp_world=args.tp_world, pp_world=args.pp_world, save_to=args.save_to, distributed_adam=not args.no_distributed_adam)
     else:
         inference_server(llama=args.llama, tokenizer=args.tokenizer, tp_world=args.tp_world, pp_world=args.pp_world)
