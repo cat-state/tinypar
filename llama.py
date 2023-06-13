@@ -29,6 +29,7 @@ from apex.optimizers.fused_adam import FusedAdam
 
 from datasets import load_dataset
 import wandb
+from tqdm import tqdm
 
 import torch._dynamo
 
@@ -39,7 +40,7 @@ def identity(x):
     return x
 
 # torch.compile = identity
-# torch._dynamo.config.cache_size_limit = 100
+torch._dynamo.config.cache_size_limit = 100
 
 SP = True
 
@@ -196,6 +197,7 @@ class Attention(nn.Module):
 
 @torch.compile
 def gated_silu(x, gate):
+    # return torch.sin(x) * gate
     return F.silu(x) * gate
 
 
@@ -208,7 +210,7 @@ class FeedForward(nn.Module):
         dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
-        hidden_dim = int(2 * hidden_dim / 3)
+        hidden_dim = hidden_dim # int(2 * hidden_dim / 3)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
         self.w1 = tensor_parallel.ColumnParallelLinear(
@@ -309,7 +311,7 @@ class SplitLlama(nn.Module):
         self.args = args
 
     # factored out for torch.compile
-    @partial(torch.compile, mode="max-autotune")
+    @torch.compile
     def transformer_block(self, x, start_pos, kv_freqs, q_freqs, mask):
         for layer in self.layers:
             x = layer(x, start_pos, kv_freqs, q_freqs, mask)
@@ -476,19 +478,27 @@ logger = getLogger()
 
 
 
-def packed_dataset(tokenier, dataset: str):
+def packed_dataset(tokenizer, dataset: str):
     cache = Path(f"{dataset}.memap")
     if cache.exists():
         return np.memmap(f"{dataset}.memap", dtype="int32", mode="r")
 
-    ds = load_dataset(dataset, split="train")
-    ds = ds.map(lambda x: {"text": tokenier.encode(x["text"], add_bos=True, add_eos=True)}, batched=True)
-    flattened = np.array([x for y in ds["text"] for x in y])
+    if torch.distributed.get_rank() == 0:
+        ds = load_dataset(dataset, split="train")
+        all_tokens = []
+        for i in tqdm(range(0, len(ds), 2048)):
+            tokens_batch = tokenizer.encode(ds[i:i+2048]["text"], add_bos=True, add_eos=True)
+            tokens_batch = [np.array(tokens) for tokens in tokens_batch]
+            all_tokens.extend(tokens_batch)
 
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Saving {dataset} to {cache}")
-    with open(cache, "wb") as f:
-        f.write(flattened.tobytes())
+        flattened = np.concatenate(all_tokens)
+        print(flattened[:1024])
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        print(f"Saving {dataset} to {cache}")
+        with open(cache, "wb") as f:
+            f.write(flattened.tobytes())
+    torch.distributed.barrier()
+    flattened = np.memmap(f"{dataset}.memap", dtype="int32", mode="r")
     return flattened
 
 def sample_random_chunks(data, chunk_size, batch_size, seed):
@@ -778,7 +788,7 @@ def main(llama: Path, tokenizer: Path, tp_world: int, pp_world: int, save_to: Pa
     torch.backends.cudnn.benchmark = True
 
     global_batch_size = 64
-    micro_batch_size = 8
+    micro_batch_size = 2
 
     setup_microbatch_calculator(
         rank=rank,
