@@ -197,7 +197,6 @@ class Attention(nn.Module):
 
 @torch.compile
 def gated_silu(x, gate):
-    # return torch.sin(x) * gate
     return F.silu(x) * gate
 
 
@@ -210,7 +209,7 @@ class FeedForward(nn.Module):
         dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
-        hidden_dim = hidden_dim # int(2 * hidden_dim / 3)
+        hidden_dim = int(2 * hidden_dim / 3)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
         self.w1 = tensor_parallel.ColumnParallelLinear(
@@ -481,24 +480,27 @@ logger = getLogger()
 def packed_dataset(tokenizer, dataset: str):
     cache = Path(f"{dataset}.memap")
     if cache.exists():
-        return np.memmap(f"{dataset}.memap", dtype="int32", mode="r")
+        return np.memmap(f"{dataset}.memap", dtype=np.uint16, mode="r")
 
     if torch.distributed.get_rank() == 0:
         ds = load_dataset(dataset, split="train")
         all_tokens = []
-        for i in tqdm(range(0, len(ds), 2048)):
-            tokens_batch = tokenizer.encode(ds[i:i+2048]["text"], add_bos=True, add_eos=True)
-            tokens_batch = [np.array(tokens) for tokens in tokens_batch]
+        for i in tqdm(range(0, len(ds), 4096)):
+            tokens_batch = tokenizer.encode(ds[i:i+4096]["text"], add_eos=True)
+            tokens_batch = [np.array(tokens, dtype=np.uint16) for tokens in tokens_batch]
             all_tokens.extend(tokens_batch)
 
         flattened = np.concatenate(all_tokens)
         print(flattened[:1024])
         cache.parent.mkdir(parents=True, exist_ok=True)
         print(f"Saving {dataset} to {cache}")
-        with open(cache, "wb") as f:
-            f.write(flattened.tobytes())
+        memmap = np.memmap(f"{dataset}.memap", dtype=np.uint16, mode="w+", shape=flattened.shape)
+        memmap[:] = flattened[:]
+        memmap.flush()
+        del memmap
     torch.distributed.barrier()
-    flattened = np.memmap(f"{dataset}.memap", dtype="int32", mode="r")
+    flattened = np.memmap(f"{dataset}.memap", dtype=np.uint16, mode="r")
+    print(flattened[:1024])
     return flattened
 
 def sample_random_chunks(data, chunk_size, batch_size, seed):
@@ -509,7 +511,7 @@ def sample_random_chunks(data, chunk_size, batch_size, seed):
     chunk_size = min(data_len, chunk_size)
     while True:
         idxes = torch.randint(0, data_len - chunk_size, (batch_size,), generator=generator)
-        chunks = torch.stack([torch.from_numpy(data[i : i + chunk_size].copy()) for i in idxes])
+        chunks = torch.stack([torch.from_numpy(data[i : i + chunk_size].copy().astype(np.int64)) for i in idxes])
         yield chunks
 
 def inference(models, tok, texts: list[str], llama_args: ModelArgs, micro_batch_size: int, rank: int, forward_backward_func, n: int, global_batch_size: int, data_parallel_size: int, stream=False):
@@ -549,7 +551,8 @@ def inference(models, tok, texts: list[str], llama_args: ModelArgs, micro_batch_
                 logits = logits[:, :, :tok.vocab_size()]
                 logprobs = torch.nn.functional.softmax(logits / 0.7, dim=-1)
                 for i, l in enumerate(prompt_lengths):
-                    new_tok = torch.multinomial(logprobs[i, l - 1], 1)
+                    # new_tok = torch.multinomial(logprobs[i, l - 1], 1)
+                    new_tok = torch.argmax(logprobs[i, l - 1])
                     print(f"{new_tok=}")
                     inputs[i, l] = new_tok
                 src = parallel_state.get_pipeline_model_parallel_last_rank()
@@ -683,10 +686,14 @@ def inference_server(
     system_prompt = """The following is a description of an AI assistant followed by a transcript of a conversation with this AI assistant.\n\n# StableAssistant - StableAssistant is A helpful and harmless Open Source AI Language Model developed by Stability and CarperAI. - StableAssistant is excited to be able to help the user, but will refuse to do anything that could be considered harmful to the user. - StableAssistant is more than just an information source, StableAssistant is also able to write poetry, short stories, and make jokes. - StableAssistant will refuse to participate in anything that could harm a human.\n\n"""
 
 
-    test_inference = inference(models, tok, [system_prompt], llama_args, 1, rank, forward_backward_func, 32, 1, 1, stream=False)
-    print(f"{rank=}: {test_inference}", flush=True)
-    for i in test_inference:
-        print("char", i, flush=True)
+    # test_inference = inference(models, tok, [system_prompt], llama_args, 1, rank, forward_backward_func, 32, 1, 1, stream=False)
+    # print(f"{rank=}: {test_inference}", flush=True)
+    # for i in test_inference:
+    #    print("char", i, flush=True)
+
+    result = "".join(infer_text("I don't know much about Hungarian underground"))
+    print(f"{result=}")
+    return
 
     if rank == 0:
         with gr.Blocks() as demo:
